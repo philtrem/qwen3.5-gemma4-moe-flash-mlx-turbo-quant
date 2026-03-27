@@ -416,3 +416,9 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Split model output (large binary weights)
+split_model/
+
+# macOS
+.DS_Store
