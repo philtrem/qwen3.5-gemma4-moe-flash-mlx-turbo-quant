@@ -1,18 +1,21 @@
 [package]
-name = "flash_expert"
+name = "flash-qwen"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-name = "flash_expert"
-crate-type = ["cdylib"]
+[[bin]]
+name = "flash-qwen"
+path = "src/main.rs"
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
-safetensors = "0.5"
+mlx-rs = "0.25"
+mlx-sys = "0.2"
+tokenizers = "0.21"
+minijinja = "2"
+memmap2 = "0.9"
 rayon = "1.10"
 libc = "0.2"
-lru = "0.14"
-memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

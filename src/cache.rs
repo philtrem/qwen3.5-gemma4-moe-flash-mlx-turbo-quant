@@ -1,98 +1,92 @@
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use mlx_rs::error::Exception;
+use mlx_rs::Array;
 
-use lru::LruCache;
-
-use crate::expert_store::{ExpertData, ExpertStore};
-
-/// Thread-safe LRU cache for expert weight data, evicting by byte budget.
-pub struct ExpertCache {
-    cache: LruCache<(u32, u32), Arc<ExpertData>>,
-    max_bytes: usize,
-    current_bytes: usize,
-    hits: AtomicU64,
-    misses: AtomicU64,
+/// KV cache for full attention layers (10 of 40).
+pub struct KVCache {
+    keys: Option<Array>,
+    values: Option<Array>,
+    offset: usize,
 }
 
-impl ExpertCache {
-    pub fn new(max_bytes: usize) -> Self {
-        // Use a large cap; actual eviction is by byte budget
-        let cap = NonZeroUsize::new(65536).unwrap();
-        ExpertCache {
-            cache: LruCache::new(cap),
-            max_bytes,
-            current_bytes: 0,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+impl KVCache {
+    pub fn new() -> Self {
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
         }
     }
 
-    /// Get cached experts or load missing ones from the store.
-    /// Returns experts in the same order as `expert_indices`.
-    pub fn get_or_load(
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn update_and_fetch(
         &mut self,
-        store: &ExpertStore,
-        layer_idx: u32,
-        expert_indices: &[u32],
-    ) -> std::io::Result<Vec<Arc<ExpertData>>> {
-        let mut results = Vec::with_capacity(expert_indices.len());
-        let mut missing_indices = Vec::new();
-        let mut missing_positions = Vec::new();
-
-        // Check cache for each expert
-        for (pos, &expert_idx) in expert_indices.iter().enumerate() {
-            let key = (layer_idx, expert_idx);
-            if let Some(data) = self.cache.get(&key) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                results.push(Some(Arc::clone(data)));
-            } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                results.push(None);
-                missing_indices.push(expert_idx);
-                missing_positions.push(pos);
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        let (k, v) = match (&self.keys, &self.values) {
+            (Some(ck), Some(cv)) => {
+                let k = mlx_rs::ops::concatenate_axis(&[ck, &keys], 2)?;
+                let v = mlx_rs::ops::concatenate_axis(&[cv, &values], 2)?;
+                (k, v)
             }
-        }
-
-        // Batch-load missing experts from SSD
-        if !missing_indices.is_empty() {
-            let loaded = store.load_experts(layer_idx, &missing_indices)?;
-            for (loaded_data, &pos) in loaded.into_iter().zip(missing_positions.iter()) {
-                let arc_data = Arc::new(loaded_data);
-                let key = (layer_idx, expert_indices[pos]);
-                let byte_size = arc_data.byte_size();
-
-                // Evict until we have room
-                while self.current_bytes + byte_size > self.max_bytes {
-                    if let Some((_, evicted)) = self.cache.pop_lru() {
-                        self.current_bytes -= evicted.byte_size();
-                    } else {
-                        break;
-                    }
-                }
-
-                self.current_bytes += byte_size;
-                self.cache.put(key, Arc::clone(&arc_data));
-                results[pos] = Some(arc_data);
-            }
-        }
-
-        Ok(results.into_iter().map(|r| r.unwrap()).collect())
-    }
-
-    pub fn stats(&self) -> (u64, u64, f64) {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        let rate = if total > 0 {
-            hits as f64 / total as f64
-        } else {
-            0.0
+            _ => (keys, values),
         };
-        (hits, misses, rate)
+        self.offset = k.dim(2) as usize;
+        self.keys = Some(k.clone());
+        self.values = Some(v.clone());
+        Ok((k, v))
+    }
+}
+
+/// Arrays cache for linear attention layers (GatedDeltaNet, 30 of 40).
+pub struct ArraysCache {
+    pub items: Vec<Option<Array>>,
+}
+
+impl ArraysCache {
+    pub fn new(size: usize) -> Self {
+        Self {
+            items: (0..size).map(|_| None).collect(),
+        }
     }
 
-    pub fn current_bytes(&self) -> usize {
-        self.current_bytes
+    pub fn get(&self, idx: usize) -> Option<&Array> {
+        self.items[idx].as_ref()
+    }
+
+    pub fn set(&mut self, idx: usize, value: Array) {
+        self.items[idx] = Some(value);
+    }
+}
+
+/// Unified cache enum.
+pub enum Cache {
+    KV(KVCache),
+    Arrays(ArraysCache),
+}
+
+impl Cache {
+    pub fn as_kv_mut(&mut self) -> &mut KVCache {
+        match self {
+            Cache::KV(kv) => kv,
+            _ => panic!("expected KVCache"),
+        }
+    }
+
+    pub fn as_arrays_mut(&mut self) -> &mut ArraysCache {
+        match self {
+            Cache::Arrays(ac) => ac,
+            _ => panic!("expected ArraysCache"),
+        }
+    }
+
+    pub fn kv_offset(&self) -> usize {
+        match self {
+            Cache::KV(kv) => kv.offset(),
+            _ => 0,
+        }
     }
 }
