@@ -98,6 +98,14 @@ pub fn generate(
         tokens_generated as f64 / elapsed
     );
 
+    let (hits, misses, rate) = mem.take_hit_stats();
+    if hits + misses > 0 {
+        eprintln!(
+            "Warm set hit rate: {:.1}% ({}/{} expert loads)",
+            rate * 100.0, hits, hits + misses
+        );
+    }
+
     Ok(tokenizer.decode(&generated))
 }
 

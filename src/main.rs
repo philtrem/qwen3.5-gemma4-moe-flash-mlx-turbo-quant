@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
             // Create ExpertMemoryManager — mmaps expert files, used for on-demand loading
             let expert_dir = model_path.join("experts");
             eprintln!("Mapping expert files from {}...", expert_dir.display());
-            let mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
+            let mut mem_mgr = memory::ExpertMemoryManager::new(&expert_dir, args.num_hidden_layers)?;
 
             // Prefetch warm set into page cache
             let warm_path = warm_experts
@@ -114,6 +114,7 @@ fn main() -> anyhow::Result<()> {
                     .collect();
 
                 let advised = mem_mgr.mlock_warm_set(&experts);
+                mem_mgr.set_warm_set(&experts);
                 eprintln!(
                     "Warm set: {} experts, prefetched {:.1} GB",
                     experts.len(),

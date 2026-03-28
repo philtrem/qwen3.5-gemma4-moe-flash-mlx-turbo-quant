@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -44,6 +46,9 @@ pub struct ExpertSlice {
 pub struct ExpertMemoryManager {
     maps: Vec<Mmap>,
     offsets: Vec<LayerTensorOffsets>,
+    warm_set: HashSet<(u32, u32)>,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
 }
 
 fn safetensors_dtype_to_mlx(dtype_str: &str) -> Dtype {
@@ -114,13 +119,42 @@ impl ExpertMemoryManager {
             offsets.push(layer_offsets);
             maps.push(mmap);
         }
-        Ok(Self { maps, offsets })
+        Ok(Self {
+            maps,
+            offsets,
+            warm_set: HashSet::new(),
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        })
+    }
+
+    /// Record the warm set for hit rate tracking.
+    pub fn set_warm_set(&mut self, experts: &[(u32, u32)]) {
+        self.warm_set = experts.iter().copied().collect();
+    }
+
+    /// Return (hits, misses, hit_rate). Resets counters.
+    pub fn take_hit_stats(&self) -> (usize, usize, f64) {
+        let h = self.hits.swap(0, Ordering::Relaxed);
+        let m = self.misses.swap(0, Ordering::Relaxed);
+        let rate = if h + m > 0 { h as f64 / (h + m) as f64 } else { 0.0 };
+        (h, m, rate)
     }
 
     /// Extract specific experts from a layer's mmap'd safetensors.
     /// Creates 9 MLX arrays, each with shape [num_experts, d1, d2],
     /// containing only the requested expert slices (copied from mmap).
+    /// Tracks warm set hit/miss stats.
     pub fn extract_experts(&self, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
+        // Track warm set hits
+        for &eidx in expert_indices {
+            if self.warm_set.contains(&(layer as u32, eidx as u32)) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let mmap = &self.maps[layer];
         let layer_offsets = &self.offsets[layer];
         let n = expert_indices.len() as i32;

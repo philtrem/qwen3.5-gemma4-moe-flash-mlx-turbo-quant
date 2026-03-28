@@ -424,9 +424,6 @@ split_model_st/
 # Rust build artifacts
 target/
 
-# Python compiled extensions (built by maturin)
-flash_qwen/_native*.so
-flash_qwen/*.so
 *.dylib
 
 # macOS

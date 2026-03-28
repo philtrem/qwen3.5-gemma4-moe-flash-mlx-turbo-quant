@@ -1,0 +1,6 @@
+- [All-Rust Engine Implementation](all-rust-engine-implementation.md) — Working at 1.3 tok/s, on-demand expert loading from mmap, mlx-rs API quirks
+- [Flash MoE History (legacy, removed)](prior-session-flash-moe-implementation.md) — Why Python+Rust hit 1.7 tok/s hard wall, motivating all-Rust rewrite
+- [Perf optimization lessons](perf_optimization_session.md) — Don't load all experts into RAM, eval barriers at CPU/GPU boundaries, madvise not mlock
+- [User Profile](user_profile.md) — ML dev on M4 base, Rust+Python, prefers concise
+- [Don't explore other projects](feedback_ignore_other_projects.md) — User rejected exploration of prior project dirs
+- [Don't re-measure known baselines](feedback_no_redundant_measurement.md) — Check memory before re-running benchmarks
