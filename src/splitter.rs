@@ -146,6 +146,31 @@ fn tensor_dtype(header: &Value, tensor_name: &str) -> io::Result<String> {
     Ok(info["dtype"].as_str().unwrap_or("F32").to_string())
 }
 
+fn parse_all_shard_headers(shard_mmaps: &HashMap<String, Mmap>) -> io::Result<HashMap<String, Value>> {
+    let mut headers = HashMap::new();
+    for (name, mmap) in shard_mmaps {
+        let (header, _) = parse_shard(mmap)?;
+        headers.insert(name.clone(), header);
+    }
+    Ok(headers)
+}
+
+fn discover_num_expert_layers(weight_map: &serde_json::Map<String, Value>) -> u32 {
+    let mut max_layer = 0u32;
+    for key in weight_map.keys() {
+        if key.contains("switch_mlp") {
+            if let Some(rest) = key.strip_prefix("language_model.model.layers.") {
+                if let Some(dot_pos) = rest.find('.') {
+                    if let Ok(idx) = rest[..dot_pos].parse::<u32>() {
+                        max_layer = max_layer.max(idx);
+                    }
+                }
+            }
+        }
+    }
+    max_layer + 1
+}
+
 /// Write resident (non-expert) weights as safetensors.
 fn write_resident_weights(
     shard_mmaps: &HashMap<String, Mmap>,
@@ -153,11 +178,7 @@ fn write_resident_weights(
     resident_tensors: &[String],
     output_dir: &Path,
 ) -> io::Result<()> {
-    let mut shard_headers: HashMap<String, Value> = HashMap::new();
-    for (name, mmap) in shard_mmaps {
-        let (header, _) = parse_shard(mmap)?;
-        shard_headers.insert(name.clone(), header);
-    }
+    let shard_headers = parse_all_shard_headers(shard_mmaps)?;
 
     let mut tensor_data: Vec<(String, Vec<u8>, String, Vec<usize>)> = Vec::new();
 
@@ -215,28 +236,8 @@ fn write_expert_safetensors(
     weight_map: &serde_json::Map<String, Value>,
     expert_dir: &Path,
 ) -> io::Result<()> {
-    let mut shard_headers: HashMap<String, Value> = HashMap::new();
-    for (name, mmap) in shard_mmaps {
-        let (header, _) = parse_shard(mmap)?;
-        shard_headers.insert(name.clone(), header);
-    }
-
-    // Discover number of layers
-    let num_layers = {
-        let mut max_layer = 0u32;
-        for key in weight_map.keys() {
-            if key.contains("switch_mlp") {
-                if let Some(rest) = key.strip_prefix("language_model.model.layers.") {
-                    if let Some(dot_pos) = rest.find('.') {
-                        if let Ok(idx) = rest[..dot_pos].parse::<u32>() {
-                            max_layer = max_layer.max(idx);
-                        }
-                    }
-                }
-            }
-        }
-        max_layer + 1
-    };
+    let shard_headers = parse_all_shard_headers(shard_mmaps)?;
+    let num_layers = discover_num_expert_layers(weight_map);
 
     eprintln!("Writing {} layers of expert safetensors...", num_layers);
 
@@ -311,27 +312,8 @@ fn write_expert_ecb(
     weight_map: &serde_json::Map<String, Value>,
     expert_dir: &Path,
 ) -> io::Result<()> {
-    let mut shard_headers: HashMap<String, Value> = HashMap::new();
-    for (name, mmap) in shard_mmaps {
-        let (header, _) = parse_shard(mmap)?;
-        shard_headers.insert(name.clone(), header);
-    }
-
-    let num_layers = {
-        let mut max_layer = 0u32;
-        for key in weight_map.keys() {
-            if key.contains("switch_mlp") {
-                if let Some(rest) = key.strip_prefix("language_model.model.layers.") {
-                    if let Some(dot_pos) = rest.find('.') {
-                        if let Ok(idx) = rest[..dot_pos].parse::<u32>() {
-                            max_layer = max_layer.max(idx);
-                        }
-                    }
-                }
-            }
-        }
-        max_layer + 1
-    };
+    let shard_headers = parse_all_shard_headers(shard_mmaps)?;
+    let num_layers = discover_num_expert_layers(weight_map);
 
     eprintln!("Writing {} layers of expert ECB files...", num_layers);
 

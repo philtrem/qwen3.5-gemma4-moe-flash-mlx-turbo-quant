@@ -78,6 +78,24 @@ pub struct ExpertSlice {
     pub down_biases: Array,
 }
 
+impl ExpertSlice {
+    /// Construct from a Vec of exactly 9 arrays in gate/up/down × weight/scales/biases order.
+    fn from_arrays(mut arrays: Vec<Array>) -> Self {
+        debug_assert_eq!(arrays.len(), 9);
+        Self {
+            gate_weight: arrays.remove(0),
+            gate_scales: arrays.remove(0),
+            gate_biases: arrays.remove(0),
+            up_weight: arrays.remove(0),
+            up_scales: arrays.remove(0),
+            up_biases: arrays.remove(0),
+            down_weight: arrays.remove(0),
+            down_scales: arrays.remove(0),
+            down_biases: arrays.remove(0),
+        }
+    }
+}
+
 /// Manages expert files with direct pread() extraction.
 ///
 /// Supports both safetensors (72 preads/layer) and ECB (8 preads/layer) formats.
@@ -100,6 +118,28 @@ struct Radvisory {
 }
 
 const F_RDADVISE: libc::c_int = 44;
+
+fn issue_rdadvise(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
+    let mut advice = Radvisory {
+        ra_offset: offset as libc::off_t,
+        ra_count: len as libc::c_int,
+    };
+    unsafe {
+        libc::fcntl(fd, F_RDADVISE, &mut advice);
+    }
+}
+
+/// Page-aligned madvise(MADV_WILLNEED). Returns bytes advised.
+fn advise_willneed(mmap: &Mmap, abs_start: usize, len: usize) -> usize {
+    const PAGE_SIZE: usize = 16384; // Apple Silicon
+    let aligned_start = abs_start & !(PAGE_SIZE - 1);
+    let aligned_len = (abs_start + len - aligned_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    unsafe {
+        let ptr = mmap.as_ptr().add(aligned_start);
+        libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
+    }
+    aligned_len
+}
 
 // ── Format parsing ──────────────────────────────────────────────────────────
 
@@ -246,15 +286,14 @@ impl ExpertMemoryManager {
             let mut ecb_infos = Vec::with_capacity(num_layers);
             for i in 0..num_layers {
                 let path = expert_dir.join(format!("layer_{:02}_experts.ecb", i));
-                let file = File::open(&path)?;
-                let info = parse_ecb_header(&file)?;
+                let pread_file = File::open(&path)?;
+                let info = parse_ecb_header(&pread_file)?;
                 ecb_infos.push(info);
-                // mmap for warm set madvise
+                // mmap for warm set madvise (separate fd)
                 let mmap_file = File::open(&path)?;
                 let mmap = unsafe { Mmap::map(&mmap_file)? };
                 maps.push(mmap);
-                // Separate fd for pread
-                files.push(File::open(&path)?);
+                files.push(pread_file);
             }
             Ok(Self {
                 files,
@@ -364,17 +403,7 @@ impl ExpertMemoryManager {
             arrays.push(arr);
         }
 
-        ExpertSlice {
-            gate_weight: arrays.remove(0),
-            gate_scales: arrays.remove(0),
-            gate_biases: arrays.remove(0),
-            up_weight: arrays.remove(0),
-            up_scales: arrays.remove(0),
-            up_biases: arrays.remove(0),
-            down_weight: arrays.remove(0),
-            down_scales: arrays.remove(0),
-            down_biases: arrays.remove(0),
-        }
+        ExpertSlice::from_arrays(arrays)
     }
 
     /// Safetensors extract: 72 preads per layer (9 tensors × 8 experts).
@@ -412,17 +441,7 @@ impl ExpertMemoryManager {
             arrays.push(arr);
         }
 
-        ExpertSlice {
-            gate_weight: arrays.remove(0),
-            gate_scales: arrays.remove(0),
-            gate_biases: arrays.remove(0),
-            up_weight: arrays.remove(0),
-            up_scales: arrays.remove(0),
-            up_biases: arrays.remove(0),
-            down_weight: arrays.remove(0),
-            down_scales: arrays.remove(0),
-            down_biases: arrays.remove(0),
-        }
+        ExpertSlice::from_arrays(arrays)
     }
 
     /// Issue F_RDADVISE for the next layer's expected expert regions.
@@ -441,14 +460,7 @@ impl ExpertMemoryManager {
                 let info = &infos[next_layer];
                 let stride = info.per_expert_stride;
                 for &eidx in expert_indices {
-                    let offset = info.data_start + eidx as usize * stride;
-                    let mut advice = Radvisory {
-                        ra_offset: offset as libc::off_t,
-                        ra_count: stride as libc::c_int,
-                    };
-                    unsafe {
-                        libc::fcntl(fd, F_RDADVISE, &mut advice);
-                    }
+                    issue_rdadvise(fd, info.data_start + eidx as usize * stride, stride);
                 }
             }
             ExpertFormat::Safetensors(offsets) => {
@@ -458,13 +470,7 @@ impl ExpertMemoryManager {
                         let offset = layer_offsets.data_start
                             + tensor.data_offset
                             + eidx as usize * tensor.per_expert_stride;
-                        let mut advice = Radvisory {
-                            ra_offset: offset as libc::off_t,
-                            ra_count: tensor.per_expert_stride as libc::c_int,
-                        };
-                        unsafe {
-                            libc::fcntl(fd, F_RDADVISE, &mut advice);
-                        }
+                        issue_rdadvise(fd, offset, tensor.per_expert_stride);
                     }
                 }
             }
@@ -474,7 +480,6 @@ impl ExpertMemoryManager {
     /// Prefetch warm set expert pages into kernel page cache via madvise.
     /// Returns total bytes advised.
     pub fn mlock_warm_set(&self, experts: &[(u32, u32)]) -> usize {
-        let page_size: usize = 16384; // Apple Silicon page size
         let mut advised = 0usize;
 
         for &(layer, expert_idx) in experts {
@@ -490,17 +495,7 @@ impl ExpertMemoryManager {
                 ExpertFormat::Ecb(infos) => {
                     let info = &infos[layer];
                     let abs_start = info.data_start + expert_idx * info.per_expert_stride;
-                    let len = info.per_expert_stride;
-
-                    let aligned_start = abs_start & !(page_size - 1);
-                    let aligned_len = (abs_start + len - aligned_start + page_size - 1)
-                        & !(page_size - 1);
-
-                    unsafe {
-                        let ptr = mmap.as_ptr().add(aligned_start);
-                        libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
-                        advised += aligned_len;
-                    }
+                    advised += advise_willneed(mmap, abs_start, info.per_expert_stride);
                 }
                 ExpertFormat::Safetensors(offsets) => {
                     let layer_offsets = &offsets[layer];
@@ -508,17 +503,7 @@ impl ExpertMemoryManager {
                         let abs_start = layer_offsets.data_start
                             + tensor.data_offset
                             + expert_idx * tensor.per_expert_stride;
-                        let len = tensor.per_expert_stride;
-
-                        let aligned_start = abs_start & !(page_size - 1);
-                        let aligned_len = (abs_start + len - aligned_start + page_size - 1)
-                            & !(page_size - 1);
-
-                        unsafe {
-                            let ptr = mmap.as_ptr().add(aligned_start);
-                            libc::madvise(ptr as *mut _, aligned_len, libc::MADV_WILLNEED);
-                            advised += aligned_len;
-                        }
+                        advised += advise_willneed(mmap, abs_start, tensor.per_expert_stride);
                     }
                 }
             }
