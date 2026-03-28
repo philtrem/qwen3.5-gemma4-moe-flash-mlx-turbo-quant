@@ -419,6 +419,15 @@ FodyWeavers.xsd
 
 # Split model output (large binary weights)
 split_model/
+split_model_st/
+
+# Rust build artifacts
+target/
+
+# Python compiled extensions (built by maturin)
+flash_qwen/_native*.so
+flash_qwen/*.so
+*.dylib
 
 # macOS
 .DS_Store
