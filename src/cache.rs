@@ -130,14 +130,14 @@ fn turbo_quantize(
 }
 
 /// TurboQuant dequantize: lookup → unscale → inverse rotate → scale by norm.
-/// Returns [B, H, T, D] in output_dtype.
+/// Returns [B, H, T, D] in bf16 to keep SDPA in the fast bf16 compute path.
+/// (Model is 9-bit quantized — bf16 is already more precision than activations carry.)
 fn turbo_dequantize(
     indices: &Array,
     norms: &Array,
     codebook: &Array,
     rotation_t: &Array,
     sqrt_d: f32,
-    output_dtype: mlx_rs::Dtype,
 ) -> Result<Array, Exception> {
     // Codebook lookup: flatten → take → reshape
     let idx = indices.as_dtype(mlx_rs::Dtype::Int32)?;
@@ -153,9 +153,9 @@ fn turbo_dequantize(
     // Inverse rotation: [B, H, T, D] @ [D, D]
     let x_unit = mlx_rs::ops::matmul(&x_rot, rotation_t)?;
 
-    // Scale by original norm
+    // Scale by original norm, cast to bf16
     let result = &x_unit * norms;
-    result.as_dtype(output_dtype)
+    result.as_dtype(mlx_rs::Dtype::Bfloat16)
 }
 
 // ============================================================
@@ -186,7 +186,6 @@ enum KVCacheInner {
         rotation: Array,
         rotation_t: Array,
         sqrt_d: f32,
-        output_dtype: mlx_rs::Dtype,
     },
 }
 
@@ -203,7 +202,7 @@ impl KVCache {
     }
 
     /// Create a TurboQuant-compressed KV cache.
-    pub fn new_quantized(head_dim: usize, bits: u8, output_dtype: mlx_rs::Dtype) -> Self {
+    pub fn new_quantized(head_dim: usize, bits: u8) -> Self {
         let (centroids, bounds) = lloyd_max_codebook(bits);
         let codebook = Array::from_slice(centroids, &[centroids.len() as i32]);
         let boundaries = Array::from_slice(bounds, &[bounds.len() as i32]);
@@ -221,7 +220,6 @@ impl KVCache {
                 rotation,
                 rotation_t,
                 sqrt_d,
-                output_dtype,
             },
             offset: 0,
         }
@@ -268,7 +266,6 @@ impl KVCache {
                 rotation,
                 rotation_t,
                 sqrt_d,
-                output_dtype,
             } => {
                 // Quantize new K/V
                 let (new_ki, new_kn) =
@@ -298,9 +295,9 @@ impl KVCache {
                 *value_indices = Some(vi.clone());
                 *value_norms = Some(vn.clone());
 
-                // Dequantize full cache for SDPA
-                let k = turbo_dequantize(&ki, &kn, codebook, rotation_t, *sqrt_d, *output_dtype)?;
-                let v = turbo_dequantize(&vi, &vn, codebook, rotation_t, *sqrt_d, *output_dtype)?;
+                // Dequantize full cache for SDPA (f32 — MLX auto-promotes with bf16 queries)
+                let k = turbo_dequantize(&ki, &kn, codebook, rotation_t, *sqrt_d)?;
+                let v = turbo_dequantize(&vi, &vn, codebook, rotation_t, *sqrt_d)?;
 
                 Ok((k, v))
             }

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 fn main() {
     // Find mlx-sys build output directory (contains MLX C++ headers)
     let target_dir = std::env::var("CARGO_TARGET_DIR")

@@ -6,6 +6,7 @@ use crate::model::mlp::QuantizedLinear;
 use crate::model::norm::RMSNorm;
 
 /// Full attention layer (10 of 40 layers — every 4th).
+#[allow(dead_code)]
 pub struct Attention {
     pub q_proj: QuantizedLinear,
     pub k_proj: QuantizedLinear,

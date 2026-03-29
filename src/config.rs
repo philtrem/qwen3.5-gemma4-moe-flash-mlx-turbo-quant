@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct QuantizationConfig {
     pub bits: u32,
     pub group_size: u32,
@@ -10,6 +11,7 @@ pub struct QuantizationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TextModelArgs {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -58,6 +60,7 @@ pub struct TextModelArgs {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 pub enum EosTokenId {
     Single(u32),
     Multiple(Vec<u32>),
@@ -70,6 +73,7 @@ impl Default for EosTokenId {
 }
 
 impl EosTokenId {
+    #[allow(dead_code)]
     pub fn ids(&self) -> Vec<u32> {
         match self {
             EosTokenId::Single(id) => vec![*id],

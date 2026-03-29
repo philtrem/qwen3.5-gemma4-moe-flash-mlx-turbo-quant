@@ -96,7 +96,7 @@ impl TextModel {
         let fa_mask = create_attention_mask(&hidden, fa_offset)?;
 
         let mut h = hidden;
-        for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+        for (_i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let mask = if layer.is_linear() {
                 None
             } else {
@@ -153,9 +153,7 @@ impl Model {
                 } else {
                     match kv_quant_bits {
                         Some(bits) => Cache::KV(KVCache::new_quantized(
-                            self.head_dim,
-                            bits,
-                            mlx_rs::Dtype::Bfloat16,
+                            self.head_dim, bits,
                         )),
                         None => Cache::KV(KVCache::new()),
                     }

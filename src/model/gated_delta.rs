@@ -10,6 +10,7 @@ use crate::perf::PerfStats;
 
 /// GatedDeltaNet — linear attention (30 of 40 layers).
 /// Uses ops-based fallback (Path B) for the recurrent update.
+#[allow(dead_code)]
 pub struct GatedDeltaNet {
     pub in_proj_qkv: QuantizedLinear,
     pub in_proj_z: QuantizedLinear,
