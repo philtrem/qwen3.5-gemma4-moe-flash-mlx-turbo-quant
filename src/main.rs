@@ -48,6 +48,9 @@ enum Command {
         top_p: f32,
         #[arg(long)]
         warm_experts: Option<PathBuf>,
+        /// TurboQuant KV cache quantization bits (2, 3, or 4). Omit for bf16.
+        #[arg(long)]
+        kv_quant_bits: Option<u8>,
     },
 }
 
@@ -73,6 +76,7 @@ fn main() -> anyhow::Result<()> {
             temperature,
             top_p,
             warm_experts,
+            kv_quant_bits,
         } => {
             // Load config
             let config_path = model_path.join("config.json");
@@ -134,6 +138,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Generate
+            if let Some(bits) = kv_quant_bits {
+                eprintln!("TurboQuant KV cache: {}-bit", bits);
+            }
             eprintln!("Engine ready.\n");
             let _output = engine::generate(
                 &mut model,
@@ -143,6 +150,7 @@ fn main() -> anyhow::Result<()> {
                 temperature,
                 top_p,
                 &mem_mgr,
+                kv_quant_bits,
             )?;
         }
     }

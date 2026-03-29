@@ -17,10 +17,11 @@ pub fn generate(
     temperature: f32,
     top_p: f32,
     mem: &ExpertMemoryManager,
+    kv_quant_bits: Option<u8>,
 ) -> anyhow::Result<String> {
     let perf = PerfStats::new();
     let input_ids = tokenizer.encode(prompt);
-    let mut cache = model.make_cache();
+    let mut cache = model.make_cache(kv_quant_bits);
 
     // Prefill
     eprintln!("Prefilling {} tokens...", input_ids.len());

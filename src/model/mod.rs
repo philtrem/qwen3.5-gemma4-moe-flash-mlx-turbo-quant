@@ -116,6 +116,7 @@ pub struct Model {
     pub model: TextModel,
     pub lm_head: QuantizedLinear,
     pub tie_word_embeddings: bool,
+    pub head_dim: usize,
 }
 
 impl Model {
@@ -142,7 +143,7 @@ impl Model {
         }
     }
 
-    pub fn make_cache(&self) -> Vec<Cache> {
+    pub fn make_cache(&self, kv_quant_bits: Option<u8>) -> Vec<Cache> {
         self.model
             .layers
             .iter()
@@ -150,7 +151,14 @@ impl Model {
                 if layer.is_linear() {
                     Cache::Arrays(ArraysCache::new(2))
                 } else {
-                    Cache::KV(KVCache::new())
+                    match kv_quant_bits {
+                        Some(bits) => Cache::KV(KVCache::new_quantized(
+                            self.head_dim,
+                            bits,
+                            mlx_rs::Dtype::Bfloat16,
+                        )),
+                        None => Cache::KV(KVCache::new()),
+                    }
                 }
             })
             .collect()
@@ -284,6 +292,7 @@ pub fn load_model(split_path: &Path, args: &TextModelArgs) -> anyhow::Result<Mod
         },
         lm_head,
         tie_word_embeddings: args.tie_word_embeddings,
+        head_dim: args.head_dim,
     })
 }
 
