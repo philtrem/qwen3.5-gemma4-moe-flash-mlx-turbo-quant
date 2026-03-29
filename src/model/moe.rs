@@ -70,9 +70,6 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Record routing for cross-token predictor
-        mem.predictor_record(self.layer_idx, &unique);
-
         if USE_ZEROCOPY {
             // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
 
@@ -87,14 +84,14 @@ impl SparseMoeBlock {
                 *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
             }
 
+            // Determine if we need per-position weighting (prefill) or scalar (decode)
+            let seq_len = x.dim(1);
+            let is_decode = seq_len == 1;
+
             // 5. Build fully lazy computation graph — NO evals in this loop.
-            // MLX sees the complete graph before eval(h), enabling dispatch pipelining.
             let mut y_accum: Option<Array> = None;
 
             for &eidx in &unique {
-                let total_weight = weight_map.get(&eidx).copied().unwrap_or(0.0);
-                if total_weight == 0.0 { continue; }
-
                 let expert = mem.extract_expert_zerocopy(self.layer_idx, eidx);
 
                 // Expert MLP: gate_proj → silu, up_proj, element-wise multiply, down_proj
@@ -112,12 +109,31 @@ impl SparseMoeBlock {
                     true, self.group_size, self.bits,
                 )?;
 
-                let scale = Array::from_f32(total_weight);
-                let weighted = &down_out * &scale;
-                y_accum = Some(match y_accum {
-                    None => weighted,
-                    Some(acc) => &acc + &weighted,
-                });
+                if is_decode {
+                    // Decode: scalar weight per expert (single position)
+                    let total_weight = weight_map.get(&eidx).copied().unwrap_or(0.0);
+                    if total_weight == 0.0 { continue; }
+                    let scale = Array::from_f32(total_weight).as_dtype(x.dtype())?;
+                    let weighted = &down_out * &scale;
+                    y_accum = Some(match y_accum {
+                        None => weighted,
+                        Some(acc) => &acc + &weighted,
+                    });
+                } else {
+                    // Prefill: per-position weighting via MLX ops
+                    // inds: [batch, seq_len, top_k], scores: [batch, seq_len, top_k]
+                    let eidx_arr = Array::from_int(eidx);
+                    let mask = inds.eq(&eidx_arr)?;
+                    let mask_f = mask.as_dtype(scores.dtype())?;
+                    // per_pos_weight: [batch, seq_len, 1] — score sum for this expert per position
+                    let per_pos_weight = mlx_rs::ops::sum_axis(&(&scores * &mask_f), -1, Some(true))?;
+                    // down_out: [batch, seq_len, hidden] × [batch, seq_len, 1] broadcast
+                    let weighted = &down_out * &per_pos_weight;
+                    y_accum = Some(match y_accum {
+                        None => weighted,
+                        Some(acc) => &acc + &weighted,
+                    });
+                }
             }
             perf.acc(&perf.extract_experts, _t.elapsed());
 

@@ -1,12 +1,9 @@
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use crate::predictor::ExpertPredictor;
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -124,7 +121,6 @@ pub struct ExpertMemoryManager {
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
-    predictor: RefCell<ExpertPredictor>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -320,7 +316,6 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                predictor: RefCell::new(ExpertPredictor::new(num_layers)),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -340,7 +335,6 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                predictor: RefCell::new(ExpertPredictor::new(num_layers)),
             })
         }
     }
@@ -356,26 +350,6 @@ impl ExpertMemoryManager {
         let m = self.misses.swap(0, Ordering::Relaxed);
         let rate = if h + m > 0 { h as f64 / (h + m) as f64 } else { 0.0 };
         (h, m, rate)
-    }
-
-    /// Record a layer's expert routing for the predictor.
-    pub fn predictor_record(&self, layer: usize, expert_indices: &[i32]) {
-        self.predictor.borrow_mut().record(layer, expert_indices);
-    }
-
-    /// End-of-token: measure prediction accuracy and swap state.
-    pub fn predictor_end_token(&self) {
-        self.predictor.borrow_mut().end_token();
-    }
-
-    /// Issue F_RDADVISE for predicted next-token experts.
-    pub fn predictor_prefetch(&self) {
-        self.predictor.borrow_mut().prefetch_next_token(self);
-    }
-
-    /// Return predictor accuracy stats and reset.
-    pub fn take_predictor_stats(&self) -> (usize, usize, f64) {
-        self.predictor.borrow_mut().take_stats()
     }
 
     /// Dummy methods for compatibility with engine.rs cache reporting
@@ -583,6 +557,35 @@ impl ExpertMemoryManager {
                             + tensor.data_offset
                             + eidx as usize * tensor.per_expert_stride;
                         issue_rdadvise(fd, offset, tensor.per_expert_stride);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prefetch current-layer expert pages via madvise(MADV_WILLNEED).
+    /// Call right after routing eval to give the kernel a head start before GPU access.
+    pub fn prefetch_experts_madvise(&self, layer: usize, expert_indices: &[i32]) {
+        if layer >= self.maps.len() {
+            return;
+        }
+        let mmap = &self.maps[layer];
+        match &self.format {
+            ExpertFormat::Ecb(infos) => {
+                let info = &infos[layer];
+                for &eidx in expert_indices {
+                    let abs_start = info.data_start + eidx as usize * info.per_expert_stride;
+                    advise_willneed(mmap, abs_start, info.per_expert_stride);
+                }
+            }
+            ExpertFormat::Safetensors(offsets) => {
+                let layer_offsets = &offsets[layer];
+                for &eidx in expert_indices {
+                    for tensor in &layer_offsets.tensors {
+                        let offset = layer_offsets.data_start
+                            + tensor.data_offset
+                            + eidx as usize * tensor.per_expert_stride;
+                        advise_willneed(mmap, offset, tensor.per_expert_stride);
                     }
                 }
             }

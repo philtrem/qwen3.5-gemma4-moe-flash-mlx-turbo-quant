@@ -57,6 +57,7 @@ pub fn generate(
     perf.reset();
     mem.reset_cache_stats();
     let t_start = Instant::now();
+    let mut t_interval = Instant::now();
     let mut tokens_generated = 1usize;
     let mut prev_text_len = text.len();
 
@@ -73,10 +74,6 @@ pub fn generate(
         next_token = sample(&logits, temperature, top_p)?;
         mlx_rs::transforms::eval(std::iter::once(&next_token))?;
 
-        // End-of-token: measure predictor accuracy, prefetch for next token
-        mem.predictor_end_token();
-        mem.predictor_prefetch();
-
         let new_tok = next_token.item::<i32>() as u32;
         generated.push(new_tok);
         tokens_generated += 1;
@@ -91,11 +88,15 @@ pub fn generate(
 
         if tokens_generated % 10 == 0 {
             let elapsed = t_start.elapsed().as_secs_f64();
+            let interval_elapsed = t_interval.elapsed().as_secs_f64();
+            let interval_rate = 10.0 / interval_elapsed;
             eprint!(
-                "\r  {} tokens, {:.1} tok/s",
+                "\r  {} tokens, {:.1} tok/s (last 10: {:.1} tok/s)",
                 tokens_generated,
-                tokens_generated as f64 / elapsed
+                tokens_generated as f64 / elapsed,
+                interval_rate,
             );
+            t_interval = Instant::now();
         }
     }
 
@@ -125,14 +126,6 @@ pub fn generate(
     }
 
     perf.report(tokens_generated);
-
-    let (pred_actual, pred_hits, pred_rate) = mem.take_predictor_stats();
-    if pred_actual > 0 {
-        eprintln!(
-            "Predictor accuracy: {:.1}% ({}/{} expert selections predicted)",
-            pred_rate * 100.0, pred_hits, pred_actual
-        );
-    }
 
     Ok(tokenizer.decode(&generated))
 }

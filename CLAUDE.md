@@ -38,17 +38,16 @@ cargo build --release
 ### `src/`
 - **main.rs** — CLI (clap): split + generate subcommands
 - **model/** — Model/TextModel/DecoderLayer, GatedDeltaNet, Attention, SparseMoeBlock, RMSNorm, MLP
-- **memory.rs** — ExpertMemoryManager: pread + zero-copy extraction, warm set madvise, predictor integration
-- **predictor.rs** — ExpertPredictor: token-to-token routing prediction + accuracy tracking
-- **engine.rs** — generate() loop + nucleus sampling + predictor stats
+- **memory.rs** — ExpertMemoryManager: pread + zero-copy extraction, warm set madvise, F_RDADVISE prefetch
+- **engine.rs** — generate() loop + nucleus sampling
 - **perf.rs** — PerfStats: per-phase timing accumulator for decode analysis
 - **ffi.rs** — gather_qmm FFI + `array_from_mmap` zero-copy wrapper
 - **ffi_zerocopy.cpp** — C++ shim: MLX array from mmap via Metal `newBufferWithBytesNoCopy`
 - **splitter.rs** — model splitter (original → resident + per-layer expert safetensors/ECB)
 - **build.rs** — compiles ffi_zerocopy.cpp with MLX C++ headers
 - Two compute paths (toggle `USE_ZEROCOPY` in moe.rs):
-  - **pread path**: pread → scatter → from_raw_data → gather_qmm (1.8 tok/s)
-  - **zero-copy path**: mmap → Metal buffer → per-expert quantized_matmul (2.4 tok/s)
+  - **pread path**: pread → scatter → from_raw_data → gather_qmm (~1.2 tok/s)
+  - **zero-copy path**: mmap → Metal buffer → per-expert quantized_matmul (~2.7 tok/s, verified coherent)
 - Per-layer eval barriers at CPU/GPU boundaries (argsort is CPU, matmul is GPU)
 
 ### Model
@@ -60,19 +59,20 @@ cargo build --release
 ## Performance
 
 ### Zero-copy path (USE_ZEROCOPY=true, current best):
-- **Short prompt**: 2.4 tok/s decode (10 tokens)
-- Decode breakdown (402ms/tok): layer eval 309ms (77%), extract 20ms (5%), routing eval 72ms (18%)
-- Bottleneck: 24 quantized_matmul GPU dispatches per layer (small matrices, dispatch overhead dominates)
+- **100 tokens**: 2.3 tok/s average decode, intervals 1.8-2.8 tok/s
+- Decode breakdown (428ms/tok): layer eval 349ms (81%), extract 30ms (7%), routing eval 50ms (12%)
+- Bottleneck: page fault latency during quantized_matmul (~37% of expert data demand-paged from SSD)
 
 ### pread path (USE_ZEROCOPY=false):
-- **Short prompt**: 1.8 tok/s decode (30 tokens)
-- Decode breakdown (554ms/tok): extract 445ms (80%), routing eval 54ms, layer eval 35ms, sort eval 22ms
-- Bottleneck: SSD I/O for ~40% page cache misses
+- **50 tokens**: ~1.2 tok/s decode (verified coherent)
+- Decode breakdown (~773ms/tok): extract 661ms (86%), routing eval 52ms, layer eval 37ms, sort eval 23ms
+- Bottleneck: SSD I/O for ~60% page cache misses
 
 ### General:
 - No swap storms. Peak expert memory ~27 MB per layer.
 - Warm set hit rate: ~63% (static, from 14-prompt profiling run)
 - Expert reuse: 46% token-to-token overlap, 62% at k=5 window
+- Cross-token predictor was removed (see memory for restoration details) — it gave ~15% speedup (2.7→2.3 tok/s) via F_RDADVISE between tokens, but overlaps heavily with warm set
 
 ## Key gotchas
 
@@ -94,5 +94,7 @@ cargo build --release
 - Expert LRU caching (both MLX Array and raw byte) does NOT help — working set (~3200 experts) >> cache size (960) on 16 GB; cache just displaces page cache
 - LZ4/Zstd compression does NOT help — decompression (4 GB/s) can't outrun SSD (2.5 GB/s) at realistic ratios
 - Windowing/caching on UMA is net-zero — explicit cache displaces page cache, same total memory
-- Zero-copy + stack() is WORSE than pread — stack triggers mass page faults (0.9 tok/s)
+- Zero-copy + stack() is WORSE than pread — stack triggers mass page faults (1.1 tok/s), destroying I/O-compute overlap
+- Reducing dispatch count does NOT help — layer eval (~280-350ms) is page-fault-dominated, not dispatch-dominated
+- Zero-copy per-expert scoring must use per-position weights during prefill (seq_len>1); scalar weighting corrupts output
 
