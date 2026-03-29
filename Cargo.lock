@@ -444,7 +444,9 @@ name = "flash-qwen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
+ "glob",
  "libc",
  "memmap2",
  "minijinja",

@@ -5,6 +5,7 @@ mod ffi;
 mod memory;
 mod model;
 mod perf;
+mod predictor;
 mod splitter;
 mod tokenizer;
 

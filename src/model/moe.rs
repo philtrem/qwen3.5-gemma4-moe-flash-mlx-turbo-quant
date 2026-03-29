@@ -9,6 +9,9 @@ use crate::memory::ExpertMemoryManager;
 use crate::model::mlp::{QuantizedLinear, MLP};
 use crate::perf::PerfStats;
 
+/// If true, use zero-copy mmap + per-expert quantized_matmul instead of gather_qmm.
+pub const USE_ZEROCOPY: bool = true;
+
 /// UMA-native sparse MoE block.
 /// Expert weights are loaded on-demand from mmap'd safetensors (not held in memory).
 pub struct SparseMoeBlock {
@@ -67,56 +70,121 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // 4. Extract only the needed experts (~27 MB for 8 experts)
-        let _t = Instant::now();
-        let experts = mem.extract_experts(self.layer_idx, &unique);
-        perf.acc(&perf.extract_experts, _t.elapsed());
+        // Record routing for cross-token predictor
+        mem.predictor_record(self.layer_idx, &unique);
 
-        // Speculative prefetch: pre-warm next layer's pages via F_RDADVISE
-        // Non-blocking (~8μs), kernel reads asynchronously while GPU processes gather_qmm
-        mem.prefetch_next_layer(self.layer_idx, &unique);
+        if USE_ZEROCOPY {
+            // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
 
-        // 5. Remap flat indices from [0-255] to [0-num_unique)
-        let remapped: Vec<i32> = flat_data.iter().map(|&idx| remap[&idx]).collect();
-        let remapped_idx = Array::from_slice(&remapped, &[flat_data.len() as i32]);
+            // 4. For each expert, create zero-copy arrays and compute matmuls
+            let _t = Instant::now();
 
-        // 6. Sort remapped indices for gather_qmm
-        let x_exp = mlx_rs::ops::expand_dims_axes(x, &[-2, -3])?;
-        let order = mlx_rs::ops::argsort(&remapped_idx)?;
-        let inv_order = mlx_rs::ops::argsort(&order)?;
-        let x_flat = mlx_rs::ops::flatten(&x_exp, Some(0), Some(-3))?;
-        let div_k = mlx_rs::ops::floor_divide(&order, &Array::from_int(k))?;
-        let x_sorted = mlx_rs::ops::indexing::take_axis(&x_flat, &div_k, 0)?;
-        let idx_sorted = mlx_rs::ops::indexing::take_axis(&remapped_idx, &order, 0)?;
+            // Build per-token score map: for each position, which experts and what weights?
+            // inds shape: [batch, top_k], scores shape: [batch, top_k]
+            // For decode (batch=1), inds is [1, 8] and flat_data is [8]
+            let mut y_accum: Option<Array> = None;
 
-        let _t = Instant::now();
-        mlx_rs::transforms::eval([&x_sorted, &idx_sorted])?;
-        perf.acc(&perf.moe_sort_eval, _t.elapsed());
+            for (ei, &eidx) in unique.iter().enumerate() {
+                let expert = mem.extract_expert_zerocopy(self.layer_idx, eidx);
 
-        // 7. gather_qmm triad on compact expert arrays
-        let x_gate = ffi::gather_qmm(
-            &x_sorted, &experts.gate_weight, &experts.gate_scales, &experts.gate_biases,
-            &idx_sorted, true, self.group_size, self.bits, true,
-        )?;
-        let x_up = ffi::gather_qmm(
-            &x_sorted, &experts.up_weight, &experts.up_scales, &experts.up_biases,
-            &idx_sorted, true, self.group_size, self.bits, true,
-        )?;
-        let x_act = &mlx_rs::nn::silu(&x_gate)? * &x_up;
-        let x_down = ffi::gather_qmm(
-            &x_act, &experts.down_weight, &experts.down_scales, &experts.down_biases,
-            &idx_sorted, true, self.group_size, self.bits, true,
-        )?;
+                // Compute expert MLP: gate_proj → silu, up_proj, element-wise multiply, down_proj
+                let gate_out = mlx_rs::ops::quantized_matmul(
+                    x, &expert.gate_weight, &expert.gate_scales, &expert.gate_biases,
+                    true, self.group_size, self.bits,
+                )?;
+                let up_out = mlx_rs::ops::quantized_matmul(
+                    x, &expert.up_weight, &expert.up_scales, &expert.up_biases,
+                    true, self.group_size, self.bits,
+                )?;
+                let act = &mlx_rs::nn::silu(&gate_out)? * &up_out;
+                let down_out = mlx_rs::ops::quantized_matmul(
+                    &act, &expert.down_weight, &expert.down_scales, &expert.down_biases,
+                    true, self.group_size, self.bits,
+                )?;
 
-        // 8. Unsort + weighted sum
-        let x_down = mlx_rs::ops::indexing::take_axis(&x_down, &inv_order, 0)?;
-        let target_shape = inds.shape().to_vec();
-        let x_down = mlx_rs::ops::unflatten(&x_down, 0, &target_shape)?;
-        let x_down = mlx_rs::ops::squeeze_axes(&x_down, &[-2])?;
+                // Weight by per-position routing scores for this expert.
+                // For each position, find the score assigned to this expert.
+                // flat_data has the expert indices per (batch, top_k) position.
+                // Build a mask/weight for positions that selected this expert.
+                let score_weights: Vec<f32> = flat_data.iter().enumerate()
+                    .map(|(_pos, &idx)| if idx == eidx { 1.0 } else { 0.0 })
+                    .collect();
 
-        let scores_exp = mlx_rs::ops::expand_dims(&scores, -1)?;
-        let y = mlx_rs::ops::sum_axis(&(&x_down * &scores_exp), -2, Some(false))?;
+                // Get the actual scores for positions that match.
+                // scores is [1, top_k] in model dtype (bf16) — convert to f32 for accumulation.
+                let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
+                mlx_rs::transforms::eval(std::iter::once(&scores_f32))?;
+                let scores_data: &[f32] = scores_f32.as_slice();
+                let total_weight: f32 = score_weights.iter().enumerate()
+                    .map(|(i, &w)| if w > 0.0 { scores_data[i] } else { 0.0 })
+                    .sum();
 
-        Ok(&y + &shared_y)
+                if total_weight > 0.0 {
+                    let scale = Array::from_f32(total_weight);
+                    let weighted = &down_out * &scale;
+                    y_accum = Some(match y_accum {
+                        None => weighted,
+                        Some(acc) => &acc + &weighted,
+                    });
+                }
+            }
+            perf.acc(&perf.extract_experts, _t.elapsed());
+
+            let y = y_accum.unwrap_or_else(|| Array::zeros::<f32>(&x.shape()).unwrap());
+            Ok(&y + &shared_y)
+        } else {
+            // Original path: pread + scatter + gather_qmm
+
+            // 4. Extract only the needed experts (~27 MB for 8 experts)
+            let _t = Instant::now();
+            let experts = mem.extract_experts(self.layer_idx, &unique);
+            perf.acc(&perf.extract_experts, _t.elapsed());
+
+            // Speculative prefetch: pre-warm next layer's pages via F_RDADVISE
+            mem.prefetch_next_layer(self.layer_idx, &unique);
+
+            // 5. Remap flat indices from [0-255] to [0-num_unique)
+            let remapped: Vec<i32> = flat_data.iter().map(|&idx| remap[&idx]).collect();
+            let remapped_idx = Array::from_slice(&remapped, &[flat_data.len() as i32]);
+
+            // 6. Sort remapped indices for gather_qmm
+            let x_exp = mlx_rs::ops::expand_dims_axes(x, &[-2, -3])?;
+            let order = mlx_rs::ops::argsort(&remapped_idx)?;
+            let inv_order = mlx_rs::ops::argsort(&order)?;
+            let x_flat = mlx_rs::ops::flatten(&x_exp, Some(0), Some(-3))?;
+            let div_k = mlx_rs::ops::floor_divide(&order, &Array::from_int(k))?;
+            let x_sorted = mlx_rs::ops::indexing::take_axis(&x_flat, &div_k, 0)?;
+            let idx_sorted = mlx_rs::ops::indexing::take_axis(&remapped_idx, &order, 0)?;
+
+            let _t = Instant::now();
+            mlx_rs::transforms::eval([&x_sorted, &idx_sorted])?;
+            perf.acc(&perf.moe_sort_eval, _t.elapsed());
+
+            // 7. gather_qmm triad on compact expert arrays
+            let x_gate = ffi::gather_qmm(
+                &x_sorted, &experts.gate_weight, &experts.gate_scales, &experts.gate_biases,
+                &idx_sorted, true, self.group_size, self.bits, true,
+            )?;
+            let x_up = ffi::gather_qmm(
+                &x_sorted, &experts.up_weight, &experts.up_scales, &experts.up_biases,
+                &idx_sorted, true, self.group_size, self.bits, true,
+            )?;
+            let x_act = &mlx_rs::nn::silu(&x_gate)? * &x_up;
+            let x_down = ffi::gather_qmm(
+                &x_act, &experts.down_weight, &experts.down_scales, &experts.down_biases,
+                &idx_sorted, true, self.group_size, self.bits, true,
+            )?;
+
+            // 8. Unsort + weighted sum
+            let x_down = mlx_rs::ops::indexing::take_axis(&x_down, &inv_order, 0)?;
+            let target_shape = inds.shape().to_vec();
+            let x_down = mlx_rs::ops::unflatten(&x_down, 0, &target_shape)?;
+            let x_down = mlx_rs::ops::squeeze_axes(&x_down, &[-2])?;
+
+            let scores_exp = mlx_rs::ops::expand_dims(&scores, -1)?;
+            let y = mlx_rs::ops::sum_axis(&(&x_down * &scores_exp), -2, Some(false))?;
+
+            Ok(&y + &shared_y)
+        }
     }
 }

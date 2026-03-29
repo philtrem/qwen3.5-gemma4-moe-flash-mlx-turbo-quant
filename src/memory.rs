@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::predictor::ExpertPredictor;
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -96,6 +99,20 @@ impl ExpertSlice {
     }
 }
 
+/// A single expert's 9 tensors (not stacked across experts).
+/// Each tensor has shape [d1, d2] — for per-expert quantized_matmul.
+pub struct SingleExpertTensors {
+    pub gate_weight: Array,
+    pub gate_scales: Array,
+    pub gate_biases: Array,
+    pub up_weight: Array,
+    pub up_scales: Array,
+    pub up_biases: Array,
+    pub down_weight: Array,
+    pub down_scales: Array,
+    pub down_biases: Array,
+}
+
 /// Manages expert files with direct pread() extraction.
 ///
 /// Supports both safetensors (72 preads/layer) and ECB (8 preads/layer) formats.
@@ -107,6 +124,7 @@ pub struct ExpertMemoryManager {
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
+    predictor: RefCell<ExpertPredictor>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -302,6 +320,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
+                predictor: RefCell::new(ExpertPredictor::new(num_layers)),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -321,6 +340,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
+                predictor: RefCell::new(ExpertPredictor::new(num_layers)),
             })
         }
     }
@@ -336,6 +356,26 @@ impl ExpertMemoryManager {
         let m = self.misses.swap(0, Ordering::Relaxed);
         let rate = if h + m > 0 { h as f64 / (h + m) as f64 } else { 0.0 };
         (h, m, rate)
+    }
+
+    /// Record a layer's expert routing for the predictor.
+    pub fn predictor_record(&self, layer: usize, expert_indices: &[i32]) {
+        self.predictor.borrow_mut().record(layer, expert_indices);
+    }
+
+    /// End-of-token: measure prediction accuracy and swap state.
+    pub fn predictor_end_token(&self) {
+        self.predictor.borrow_mut().end_token();
+    }
+
+    /// Issue F_RDADVISE for predicted next-token experts.
+    pub fn predictor_prefetch(&self) {
+        self.predictor.borrow_mut().prefetch_next_token(self);
+    }
+
+    /// Return predictor accuracy stats and reset.
+    pub fn take_predictor_stats(&self) -> (usize, usize, f64) {
+        self.predictor.borrow_mut().take_stats()
     }
 
     /// Dummy methods for compatibility with engine.rs cache reporting
@@ -446,6 +486,47 @@ impl ExpertMemoryManager {
         ExpertSlice::from_arrays(arrays)
     }
 
+    /// Zero-copy extract: create MLX arrays backed directly by mmap'd memory.
+    /// Requires ECB format (expert data is contiguous and page-aligned).
+    /// Returns per-expert tensors for use with quantized_matmul (not gather_qmm).
+    pub fn extract_expert_zerocopy(&self, layer: usize, expert_idx: i32) -> SingleExpertTensors {
+        let mmap = &self.maps[layer];
+        let info = match &self.format {
+            ExpertFormat::Ecb(infos) => &infos[layer],
+            ExpertFormat::Safetensors(_) => panic!("zero-copy requires ECB format"),
+        };
+
+        let expert_offset = info.data_start + expert_idx as usize * info.per_expert_stride;
+        let mmap_ptr = mmap.as_ptr();
+
+        let mut arrays = Vec::with_capacity(9);
+        for tensor in &info.tensors {
+            let tensor_offset = expert_offset + tensor.offset_within_expert;
+            let arr = unsafe {
+                crate::ffi::array_from_mmap(
+                    mmap_ptr,
+                    tensor_offset,
+                    tensor.stride,
+                    &tensor.expert_shape,
+                    tensor.dtype,
+                )
+            };
+            arrays.push(arr);
+        }
+
+        SingleExpertTensors {
+            gate_weight: arrays.remove(0),
+            gate_scales: arrays.remove(0),
+            gate_biases: arrays.remove(0),
+            up_weight: arrays.remove(0),
+            up_scales: arrays.remove(0),
+            up_biases: arrays.remove(0),
+            down_weight: arrays.remove(0),
+            down_scales: arrays.remove(0),
+            down_biases: arrays.remove(0),
+        }
+    }
+
     /// Issue F_RDADVISE for the next layer's expected expert regions.
     /// Non-blocking — kernel reads asynchronously while GPU processes current layer.
     /// Exploits expert locality across adjacent layers.
@@ -467,6 +548,35 @@ impl ExpertMemoryManager {
             }
             ExpertFormat::Safetensors(offsets) => {
                 let layer_offsets = &offsets[next_layer];
+                for &eidx in expert_indices {
+                    for tensor in &layer_offsets.tensors {
+                        let offset = layer_offsets.data_start
+                            + tensor.data_offset
+                            + eidx as usize * tensor.per_expert_stride;
+                        issue_rdadvise(fd, offset, tensor.per_expert_stride);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue F_RDADVISE for specific experts at a given layer.
+    /// Used by the predictor for cross-token prefetch.
+    pub fn prefetch_experts(&self, layer: usize, expert_indices: &[i32]) {
+        if layer >= self.files.len() {
+            return;
+        }
+        let fd = self.files[layer].as_raw_fd();
+        match &self.format {
+            ExpertFormat::Ecb(infos) => {
+                let info = &infos[layer];
+                let stride = info.per_expert_stride;
+                for &eidx in expert_indices {
+                    issue_rdadvise(fd, info.data_start + eidx as usize * stride, stride);
+                }
+            }
+            ExpertFormat::Safetensors(offsets) => {
+                let layer_offsets = &offsets[layer];
                 for &eidx in expert_indices {
                     for tensor in &layer_offsets.tensors {
                         let offset = layer_offsets.data_start
