@@ -70,10 +70,14 @@ impl SparseMoeBlock {
             .collect();
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Signal I/O thread to start prefetching this layer's experts NOW.
-        // Non-blocking: returns immediately. The I/O thread reads pages into
-        // cache while we build the lazy graph (~26ms head start before eval).
-        mem.prefetch_async(self.layer_idx, &unique);
+        // Send cold experts first to I/O thread so it spends its lead time
+        // on high-value SSD reads (2.4 GB/s sequential), not on warm experts
+        // that return instantly from page cache.
+        let (_warm, cold) = mem.partition_warm_cold(self.layer_idx, &unique);
+        let cold_first: Vec<i32> = cold.iter()
+            .chain(unique.iter().filter(|e| !cold.contains(e)))
+            .copied().collect();
+        mem.prefetch_async(self.layer_idx, &cold_first);
 
         if USE_ZEROCOPY {
             // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers

@@ -454,6 +454,22 @@ impl ExpertMemoryManager {
         }
     }
 
+    /// Partition expert indices into (warm, cold) based on the static warm set.
+    /// Warm experts are likely in page cache (free via mmap). Cold experts need
+    /// SSD reads — the I/O thread should prioritize these.
+    pub fn partition_warm_cold(&self, layer: usize, expert_indices: &[i32]) -> (Vec<i32>, Vec<i32>) {
+        let mut warm = Vec::new();
+        let mut cold = Vec::new();
+        for &eidx in expert_indices {
+            if self.warm_set.contains(&(layer as u32, eidx as u32)) {
+                warm.push(eidx);
+            } else {
+                cold.push(eidx);
+            }
+        }
+        (warm, cold)
+    }
+
     /// Extract specific experts from a layer.
     /// Dispatches to ECB (8 parallel preads) or safetensors (72 preads) path.
     pub fn extract_experts(&self, layer: usize, expert_indices: &[i32]) -> ExpertSlice {
