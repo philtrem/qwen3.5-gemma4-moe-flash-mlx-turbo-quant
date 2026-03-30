@@ -51,6 +51,15 @@ enum Command {
         /// TurboQuant KV cache quantization bits (2, 3, or 4). Omit for bf16.
         #[arg(long)]
         kv_quant_bits: Option<u8>,
+        /// Disable speculative F_RDADVISE prefetch for next-layer predicted experts.
+        #[arg(long)]
+        no_speculate: bool,
+        /// Disable async_eval pipeline (use sync eval instead).
+        #[arg(long)]
+        no_pipeline: bool,
+        /// Skip warm set loading at startup.
+        #[arg(long)]
+        no_warm_set: bool,
     },
 }
 
@@ -77,10 +86,13 @@ fn main() -> anyhow::Result<()> {
             top_p,
             warm_experts,
             kv_quant_bits,
+            no_speculate,
+            no_pipeline,
+            no_warm_set,
         } => {
             // Load config
             let config_path = model_path.join("config.json");
-            let (args, _quant) = config::TextModelArgs::from_config_file(&config_path)?;
+            let (args, quant) = config::TextModelArgs::from_config_file(&config_path)?;
 
             // Load tokenizer
             eprintln!("Loading tokenizer from {}...", tokenizer_path.display());
@@ -105,7 +117,7 @@ fn main() -> anyhow::Result<()> {
             // This allocates 2.76 GB of Metal buffers. Loading before warm set
             // prefetch ensures madvise pages aren't evicted by weight allocation.
             eprintln!("Loading model from {}...", model_path.display());
-            let mut model = model::load_model(&model_path, &args)?;
+            let mut model = model::load_model(&model_path, &args, quant.as_ref())?;
 
             // Prefetch warm set into page cache AFTER model loading
             let warm_path = warm_experts
@@ -114,7 +126,7 @@ fn main() -> anyhow::Result<()> {
                     if auto.exists() { Some(auto) } else { None }
                 });
 
-            if let Some(wp) = warm_path {
+            if let Some(wp) = warm_path.filter(|_| !no_warm_set) {
                 eprintln!("Prefetching warm set from {}...", wp.display());
                 let warm: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&wp)?)?;
@@ -141,7 +153,15 @@ fn main() -> anyhow::Result<()> {
             if let Some(bits) = kv_quant_bits {
                 eprintln!("TurboQuant KV cache: {}-bit", bits);
             }
+            let speculate = !no_speculate;
+            let sync_mlock = !no_pipeline;
             eprintln!("Engine ready.\n");
+            if no_speculate {
+                eprintln!("Speculative prediction: disabled");
+            }
+            if no_pipeline {
+                eprintln!("Pipeline: disabled (sync eval)");
+            }
             let _output = engine::generate(
                 &mut model,
                 &tokenizer,
@@ -151,6 +171,8 @@ fn main() -> anyhow::Result<()> {
                 top_p,
                 &mem_mgr,
                 kv_quant_bits,
+                speculate,
+                sync_mlock,
             )?;
         }
     }

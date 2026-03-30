@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io::Write;
 use std::time::Instant;
 
@@ -6,6 +7,7 @@ use mlx_rs::Array;
 
 use crate::memory::ExpertMemoryManager;
 use crate::model::Model;
+use crate::model::moe::TransitionProfiler;
 use crate::perf::PerfStats;
 use crate::tokenizer::QwenTokenizer;
 
@@ -18,8 +20,11 @@ pub fn generate(
     top_p: f32,
     mem: &ExpertMemoryManager,
     kv_quant_bits: Option<u8>,
+    speculate: bool,
+    sync_mlock: bool,
 ) -> anyhow::Result<String> {
     let perf = PerfStats::new();
+    let tp = RefCell::new(TransitionProfiler::new(40));
     let input_ids = tokenizer.encode(prompt);
     let mut cache = model.make_cache(kv_quant_bits);
 
@@ -30,7 +35,7 @@ pub fn generate(
         &input_ids.iter().map(|&x| x as i32).collect::<Vec<_>>(),
         &[1, input_ids.len() as i32],
     );
-    let logits = model.forward(&input, &mut cache, mem, &perf)?;
+    let logits = model.forward(&input, &mut cache, mem, &perf, false, false, None)?;
     mlx_rs::transforms::eval(std::iter::once(&logits))?;
     let prefill_time = t0.elapsed();
     eprintln!(
@@ -70,10 +75,12 @@ pub fn generate(
         }
 
         let input = Array::from_slice(&[tok_id as i32], &[1, 1]);
-        let logits = model.forward(&input, &mut cache, mem, &perf)?;
+        let logits = model.forward(&input, &mut cache, mem, &perf, speculate, sync_mlock, Some(&tp))?;
         let logits = mlx_rs::ops::squeeze_axes(&logits, &[1])?;
         next_token = sample(&logits, temperature, top_p)?;
         mlx_rs::transforms::eval(std::iter::once(&next_token))?;
+
+        tp.borrow_mut().end_token();
 
         let new_tok = next_token.item::<i32>() as u32;
         generated.push(new_tok);
@@ -127,6 +134,7 @@ pub fn generate(
     }
 
     perf.report(tokens_generated);
+    tp.borrow().report();
 
     Ok(tokenizer.decode(&generated))
 }

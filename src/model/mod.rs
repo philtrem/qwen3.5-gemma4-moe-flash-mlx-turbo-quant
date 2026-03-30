@@ -17,8 +17,9 @@ use crate::memory::ExpertMemoryManager;
 use crate::perf::PerfStats;
 use attention::Attention;
 use gated_delta::GatedDeltaNet;
+use std::cell::RefCell;
 use mlp::{QuantizedLinear, MLP};
-use moe::SparseMoeBlock;
+use moe::{SparseMoeBlock, TransitionProfiler};
 use norm::RMSNorm;
 
 pub enum AttentionLayer {
@@ -45,6 +46,9 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
+        next_layer_gate: Option<(&QuantizedLinear, &norm::RMSNorm)>,
+        sync_mlock: bool,
+        tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attention {
@@ -57,7 +61,7 @@ impl DecoderLayer {
         };
         let h = x + &attn_out;
         let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed, mem, perf)?;
+        let mlp_out = self.mlp.forward(&normed, mem, perf, next_layer_gate, sync_mlock, tp)?;
         Ok(&h + &mlp_out)
     }
 }
@@ -80,6 +84,9 @@ impl TextModel {
         cache: &mut [Cache],
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
+        speculate: bool,
+        sync_mlock: bool,
+        tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let flat_ids = input_ids.flatten(None, None)?;
         let w = mlx_rs::ops::indexing::take_axis(&self.embed_tokens_weight, &flat_ids, 0)?;
@@ -96,16 +103,80 @@ impl TextModel {
         let fa_mask = create_attention_mask(&hidden, fa_offset)?;
 
         let mut h = hidden;
-        for (_i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+        let num_layers = self.layers.len();
+        let is_decode = input_ids.dim(1) == 1;
+        let use_pipeline = sync_mlock && speculate && is_decode;
+        let need_predictions = speculate || use_pipeline;
+
+        for i in 0..num_layers {
+            let (head, tail) = self.layers.split_at_mut(i + 1);
+            let layer = &mut head[i];
+            let next_gate_ln = if need_predictions {
+                tail.first()
+                    .map(|next| (&next.mlp.gate, &next.post_attention_layernorm))
+            } else {
+                None
+            };
             let mask = if layer.is_linear() {
                 None
             } else {
                 fa_mask.as_ref()
             };
-            h = layer.forward(&h, mask, c, mem, perf)?;
-            let _t = Instant::now();
-            mlx_rs::transforms::eval(std::iter::once(&h))?;
-            perf.acc(&perf.layer_eval, _t.elapsed());
+            h = layer.forward(&h, mask, &mut cache[i], mem, perf, next_gate_ln, sync_mlock, tp)?;
+
+            if use_pipeline && i + 1 < num_layers {
+                let _t = Instant::now();
+                mlx_rs::transforms::async_eval(std::iter::once(&h))?;
+                let async_dur = _t.elapsed();
+
+                // Main thread preads next layer's predicted experts while GPU runs
+                let _t2 = Instant::now();
+                if let Some(tp_ref) = tp {
+                    let tp_borrow = tp_ref.borrow();
+                    if let Some((pred_layer, ref predicted)) = tp_borrow.pending_prediction {
+                        if pred_layer == i + 1 {
+                            let batch = mem.extract_experts_hybrid(i + 1, predicted);
+                            mem.set_preloaded(i + 1, predicted.clone(), batch);
+                        }
+                    }
+                }
+                let pread_dur = _t2.elapsed();
+
+                // Wait for GPU to finish
+                let _t3 = Instant::now();
+                mlx_rs::transforms::eval(std::iter::once(&h))?;
+                let eval_dur = _t3.elapsed();
+
+                if i < 3 {
+                    eprintln!("  L{}: async_eval={:.1}ms pread={:.1}ms eval_wait={:.1}ms",
+                        i, async_dur.as_secs_f64()*1000.0,
+                        pread_dur.as_secs_f64()*1000.0,
+                        eval_dur.as_secs_f64()*1000.0);
+                }
+                perf.acc(&perf.layer_eval, _t.elapsed());
+            } else {
+                let _t = Instant::now();
+                mlx_rs::transforms::async_eval(std::iter::once(&h))?;
+
+                // Speculative prefetch: F_RDADVISE for predicted experts.
+                // Lightest hint — just fcntl per expert, no page table walks.
+                if speculate && i + 1 < num_layers {
+                    if let Some(tp_ref) = tp {
+                        let tp_borrow = tp_ref.borrow();
+                        if let Some((pred_layer, ref predicted)) = tp_borrow.pending_prediction {
+                            if pred_layer == i + 1 {
+                                mem.prefetch_experts(pred_layer, predicted);
+                            }
+                        }
+                    }
+                }
+
+                let _tw = Instant::now();
+                mlx_rs::transforms::eval(std::iter::once(&h))?;
+                perf.acc(&perf.eval_wait, _tw.elapsed());
+
+                perf.acc(&perf.layer_eval, _t.elapsed());
+            }
         }
 
         self.norm.forward(&h)
@@ -126,8 +197,11 @@ impl Model {
         cache: &mut [Cache],
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
+        speculate: bool,
+        sync_mlock: bool,
+        tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
-        let out = self.model.forward(input_ids, cache, mem, perf)?;
+        let out = self.model.forward(input_ids, cache, mem, perf, speculate, sync_mlock, tp)?;
         if self.tie_word_embeddings {
             mlx_rs::ops::quantized_matmul(
                 &out,
@@ -165,7 +239,7 @@ impl Model {
 
 // --- Weight loading ---
 
-pub fn load_model(split_path: &Path, args: &TextModelArgs) -> anyhow::Result<Model> {
+pub fn load_model(split_path: &Path, args: &TextModelArgs, quant: Option<&crate::config::QuantizationConfig>) -> anyhow::Result<Model> {
     eprintln!("Loading resident weights...");
     let resident_path = split_path.join("resident/resident.safetensors");
     let weights = load_safetensors_map(&resident_path)?;
@@ -179,8 +253,9 @@ pub fn load_model(split_path: &Path, args: &TextModelArgs) -> anyhow::Result<Mod
     // Expert weights are NOT loaded here — they're mmap'd by ExpertMemoryManager
     // and extracted on-demand during forward passes (~27 MB per layer vs 34.6 GB)
 
-    let bits = 8i32;
-    let group_size = 32i32;
+    let bits = quant.map(|q| q.bits as i32).unwrap_or(8);
+    let group_size = quant.map(|q| q.group_size as i32).unwrap_or(32);
+    eprintln!("  Quantization: {}-bit, group_size={}", bits, group_size);
 
     let mut layers = Vec::with_capacity(args.num_hidden_layers);
     for i in 0..args.num_hidden_layers {

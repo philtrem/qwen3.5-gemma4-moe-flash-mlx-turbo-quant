@@ -1,16 +1,90 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use mlx_rs::error::Exception;
 use mlx_rs::Array;
 
 use crate::ffi;
-use crate::memory::ExpertMemoryManager;
+use crate::memory::{ExpertMemoryManager, SingleExpertTensors};
 use crate::model::mlp::{QuantizedLinear, MLP};
+use crate::model::norm::RMSNorm;
 use crate::perf::PerfStats;
+
+/// Tracks gate-reuse prediction accuracy: how well layer L's gate input
+/// predicts layer L+1's routing when run through L+1's router.
+pub struct TransitionProfiler {
+    num_layers: usize,
+    gate_total: usize,
+    gate_hits: usize,
+    gate_per_layer_total: Vec<usize>,
+    gate_per_layer_hits: Vec<usize>,
+    /// Pending prediction from previous layer (layer_idx, predicted_experts)
+    pub pending_prediction: Option<(usize, Vec<i32>)>,
+}
+
+impl TransitionProfiler {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            num_layers,
+            gate_total: 0,
+            gate_hits: 0,
+            gate_per_layer_total: vec![0; num_layers],
+            gate_per_layer_hits: vec![0; num_layers],
+            pending_prediction: None,
+        }
+    }
+
+    /// Compare predicted experts (from gate reuse) against actual routing.
+    pub fn record_gate_reuse(&mut self, layer: usize, predicted: &[i32], actual: &[i32]) {
+        for &e in actual {
+            self.gate_total += 1;
+            self.gate_per_layer_total[layer] += 1;
+            if predicted.contains(&e) {
+                self.gate_hits += 1;
+                self.gate_per_layer_hits[layer] += 1;
+            }
+        }
+    }
+
+    /// End of token: clear pending prediction.
+    pub fn end_token(&mut self) {
+        self.pending_prediction = None;
+    }
+
+    /// Report prediction accuracy.
+    pub fn report(&self) {
+        if self.gate_total > 0 {
+            eprintln!("\n=== Gate-Reuse Prediction (pre-MoE + next LN, top-12) ===");
+            eprintln!(
+                "  Overall: {:.1}% ({}/{})",
+                self.gate_hits as f64 / self.gate_total as f64 * 100.0,
+                self.gate_hits,
+                self.gate_total
+            );
+            for i in 0..self.num_layers {
+                let t = self.gate_per_layer_total[i];
+                if t > 0 {
+                    let h = self.gate_per_layer_hits[i];
+                    eprintln!(
+                        "  Layer {:>2}: {:.1}% ({}/{})",
+                        i,
+                        h as f64 / t as f64 * 100.0,
+                        h,
+                        t
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// If true, use zero-copy mmap + per-expert quantized_matmul instead of gather_qmm.
 pub const USE_ZEROCOPY: bool = true;
+
+/// Cached check for NOREACTIVE env var (avoids 40 env::var lookups per token).
+static NOREACTIVE: OnceLock<bool> = OnceLock::new();
 
 /// UMA-native sparse MoE block.
 /// Expert weights are loaded on-demand from mmap'd safetensors (not held in memory).
@@ -26,7 +100,15 @@ pub struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    pub fn forward(&self, x: &Array, mem: &ExpertMemoryManager, perf: &PerfStats) -> Result<Array, Exception> {
+    pub fn forward(
+        &self,
+        x: &Array,
+        mem: &ExpertMemoryManager,
+        perf: &PerfStats,
+        next_layer_gate: Option<(&QuantizedLinear, &RMSNorm)>,
+        sync_preload: bool,
+        tp: Option<&RefCell<TransitionProfiler>>,
+    ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
 
         // 1. Router
@@ -51,78 +133,178 @@ impl SparseMoeBlock {
         let shared_gate = mlx_rs::ops::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_y = &shared_gate * &shared_y;
 
-        // 3. Eval routing indices → read to CPU for on-demand expert loading.
-        // Single eval materializes the entire routing chain (gate + softmax + argpartition)
-        // plus any pending lazy work from attention (GDN recurrent tail during decode).
+        // 3. Compute routing indices + scores (lazy, will batch with prediction)
         let flat_idx = inds.reshape(&[-1])?;
+        let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
+
+        let seq_len = x.dim(1);
+        let is_decode = seq_len == 1;
+
+        // Speculative prediction for next layer (lazy graph, batched with routing eval)
+        let pred_flat = if is_decode {
+            if let Some((next_gate, next_ln)) = next_layer_gate {
+                let pred_k = 12i32;
+                let pred_normed = next_ln.forward(x)?;
+                let pred_logits = next_gate.forward(&pred_normed)?;
+                let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
+                let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
+                let pred_split = pred_num - pred_k;
+                let pred_parts =
+                    mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
+                let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
+                Some(pred_topk.reshape(&[-1])?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Single GPU sync: routing + scores + prediction (zero extra sync overhead)
         let _t = Instant::now();
-        mlx_rs::transforms::eval(std::iter::once(&flat_idx))?;
+        if let Some(ref pf) = pred_flat {
+            mlx_rs::transforms::eval([&flat_idx, &scores_f32, pf])?;
+        } else {
+            mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
+        }
         perf.acc(&perf.moe_routing_eval, _t.elapsed());
         let flat_data: &[i32] = flat_idx.as_slice();
+        let scores_data: &[f32] = scores_f32.as_slice();
 
         // Find unique expert indices and build remap table
         let _t = Instant::now();
         let mut unique: Vec<i32> = flat_data.to_vec();
         unique.sort();
         unique.dedup();
-        let remap: HashMap<i32, i32> = unique.iter().enumerate()
+        let remap: HashMap<i32, i32> = unique
+            .iter()
+            .enumerate()
             .map(|(i, &orig)| (orig, i as i32))
             .collect();
+
+        // Blocking prefetch: parallel pread all experts to warm page cache.
+        // Prevents page faults during eval — pread at contiguous MB granularity
+        // is far more efficient than 16KB page fault traps.
+        // Skip if NOREACTIVE=1 (for A/B testing).
+        if is_decode && !*NOREACTIVE.get_or_init(|| std::env::var("NOREACTIVE").is_ok()) {
+            mem.pread_experts_sync(self.layer_idx, &unique);
+        }
+
+        // Pre-compute per-expert score weights (for zero-copy path)
+        let mut weight_map: HashMap<i32, f32> = HashMap::new();
+        for (i, &idx) in flat_data.iter().enumerate() {
+            *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
+        }
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Decode only: send cold experts first to I/O thread, then wait
-        // after graph build so all pages are cached before GPU eval.
-        // Prefill skips this — faults are amortized over many positions.
-        let seq_len = x.dim(1);
-        let is_decode = seq_len == 1;
+        // Check pending prediction from previous layer (gate-reuse accuracy)
+        if let Some(tp_ref) = tp {
+            let mut tp_mut = tp_ref.borrow_mut();
+            if let Some((pred_layer, predicted)) = tp_mut.pending_prediction.take() {
+                if pred_layer == self.layer_idx {
+                    tp_mut.record_gate_reuse(self.layer_idx, &predicted, &unique);
+                }
+            }
+        }
 
-        if is_decode {
-            let (_warm, cold) = mem.partition_warm_cold(self.layer_idx, &unique);
-            let cold_first: Vec<i32> = cold.iter()
-                .chain(unique.iter().filter(|e| !cold.contains(e)))
-                .copied().collect();
-            mem.prefetch_async(self.layer_idx, &cold_first);
+        // Record prediction for pipeline prefetch + fire F_RDADVISE
+        if let Some(ref pf) = pred_flat {
+            let pred_data: &[i32] = pf.as_slice();
+            let mut pred_unique: Vec<i32> = pred_data.to_vec();
+            pred_unique.sort();
+            pred_unique.dedup();
+            let next_layer = self.layer_idx + 1;
+            // Prediction recorded — speculative prefetch fires from mod.rs
+            // during eval (after blocking pread is done) to avoid SSD contention.
+            if let Some(tp_ref) = tp {
+                tp_ref.borrow_mut().pending_prediction = Some((next_layer, pred_unique));
+            }
         }
 
         if USE_ZEROCOPY {
-            // Zero-copy path: per-expert quantized_matmul from mmap'd Metal buffers
-
-            // 4. Pre-compute per-expert score weights on CPU (one eval, outside loop)
             let _t = Instant::now();
-            let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
-            mlx_rs::transforms::eval(std::iter::once(&scores_f32))?;
-            let scores_data: &[f32] = scores_f32.as_slice();
 
-            let mut weight_map: HashMap<i32, f32> = HashMap::new();
-            for (i, &idx) in flat_data.iter().enumerate() {
-                *weight_map.entry(idx).or_insert(0.0) += scores_data[i];
-            }
+            // Use preloaded experts (from async_eval pipeline) or fall back to zerocopy
+            let preloaded = mem.take_preloaded(self.layer_idx);
+            let experts: Vec<SingleExpertTensors> = if let Some((_pre_idx, pre_batch)) = preloaded {
+                // Preloaded from hybrid buffer — fault-free.
+                // Handle prediction misses via hybrid pread into spare buffer.
+                let mut pre_opts: Vec<Option<SingleExpertTensors>> =
+                    pre_batch.into_iter().map(Some).collect();
+                let mut result: Vec<Option<SingleExpertTensors>> = Vec::with_capacity(unique.len());
+                let mut misses: Vec<(usize, i32)> = Vec::new();
+                for (i, &eidx) in unique.iter().enumerate() {
+                    if let Some(pos) = _pre_idx.iter().position(|&e| e == eidx) {
+                        if let Some(expert) = pre_opts[pos].take() {
+                            result.push(Some(expert));
+                            continue;
+                        }
+                    }
+                    misses.push((i, eidx));
+                    result.push(None);
+                }
+                if !misses.is_empty() {
+                    let miss_indices: Vec<i32> = misses.iter().map(|(_, e)| *e).collect();
+                    let miss_experts = mem.extract_experts_hybrid(self.layer_idx, &miss_indices);
+                    let mut miss_iter = miss_experts.into_iter();
+                    for (i, _) in &misses {
+                        result[*i] = Some(miss_iter.next().unwrap());
+                    }
+                }
+                result.into_iter().map(|o| o.unwrap()).collect()
+            } else if sync_preload && is_decode {
+                // Pipeline mode, no preloaded data (layer 0): sync hybrid extract
+                mem.extract_experts_hybrid(self.layer_idx, &unique)
+            } else {
+                // Prefill or non-pipeline decode: mmap zerocopy
+                let mut v = Vec::with_capacity(unique.len());
+                for &eidx in &unique {
+                    v.push(mem.extract_expert_zerocopy(self.layer_idx, eidx));
+                }
+                v
+            };
 
-            // 5. Build fully lazy computation graph — NO evals in this loop.
             let mut y_accum: Option<Array> = None;
 
-            for &eidx in &unique {
-                let expert = mem.extract_expert_zerocopy(self.layer_idx, eidx);
+            for (idx, &eidx) in unique.iter().enumerate() {
+                let expert = &experts[idx];
 
                 // Expert MLP: gate_proj → silu, up_proj, element-wise multiply, down_proj
                 let gate_out = mlx_rs::ops::quantized_matmul(
-                    x, &expert.gate_weight, &expert.gate_scales, &expert.gate_biases,
-                    true, self.group_size, self.bits,
+                    x,
+                    &expert.gate_weight,
+                    &expert.gate_scales,
+                    &expert.gate_biases,
+                    true,
+                    self.group_size,
+                    self.bits,
                 )?;
                 let up_out = mlx_rs::ops::quantized_matmul(
-                    x, &expert.up_weight, &expert.up_scales, &expert.up_biases,
-                    true, self.group_size, self.bits,
+                    x,
+                    &expert.up_weight,
+                    &expert.up_scales,
+                    &expert.up_biases,
+                    true,
+                    self.group_size,
+                    self.bits,
                 )?;
                 let act = &mlx_rs::nn::silu(&gate_out)? * &up_out;
                 let down_out = mlx_rs::ops::quantized_matmul(
-                    &act, &expert.down_weight, &expert.down_scales, &expert.down_biases,
-                    true, self.group_size, self.bits,
+                    &act,
+                    &expert.down_weight,
+                    &expert.down_scales,
+                    &expert.down_biases,
+                    true,
+                    self.group_size,
+                    self.bits,
                 )?;
 
                 if is_decode {
                     // Decode: scalar weight per expert (single position)
                     let total_weight = weight_map.get(&eidx).copied().unwrap_or(0.0);
-                    if total_weight == 0.0 { continue; }
+                    if total_weight == 0.0 {
+                        continue;
+                    }
                     let scale = Array::from_f32(total_weight).as_dtype(x.dtype())?;
                     let weighted = &down_out * &scale;
                     y_accum = Some(match y_accum {
@@ -131,13 +313,11 @@ impl SparseMoeBlock {
                     });
                 } else {
                     // Prefill: per-position weighting via MLX ops
-                    // inds: [batch, seq_len, top_k], scores: [batch, seq_len, top_k]
                     let eidx_arr = Array::from_int(eidx);
                     let mask = inds.eq(&eidx_arr)?;
                     let mask_f = mask.as_dtype(scores.dtype())?;
-                    // per_pos_weight: [batch, seq_len, 1] — score sum for this expert per position
-                    let per_pos_weight = mlx_rs::ops::sum_axis(&(&scores * &mask_f), -1, Some(true))?;
-                    // down_out: [batch, seq_len, hidden] × [batch, seq_len, 1] broadcast
+                    let per_pos_weight =
+                        mlx_rs::ops::sum_axis(&(&scores * &mask_f), -1, Some(true))?;
                     let weighted = &down_out * &per_pos_weight;
                     y_accum = Some(match y_accum {
                         None => weighted,
@@ -179,17 +359,38 @@ impl SparseMoeBlock {
 
             // 7. gather_qmm triad on compact expert arrays
             let x_gate = ffi::gather_qmm(
-                &x_sorted, &experts.gate_weight, &experts.gate_scales, &experts.gate_biases,
-                &idx_sorted, true, self.group_size, self.bits, true,
+                &x_sorted,
+                &experts.gate_weight,
+                &experts.gate_scales,
+                &experts.gate_biases,
+                &idx_sorted,
+                true,
+                self.group_size,
+                self.bits,
+                true,
             )?;
             let x_up = ffi::gather_qmm(
-                &x_sorted, &experts.up_weight, &experts.up_scales, &experts.up_biases,
-                &idx_sorted, true, self.group_size, self.bits, true,
+                &x_sorted,
+                &experts.up_weight,
+                &experts.up_scales,
+                &experts.up_biases,
+                &idx_sorted,
+                true,
+                self.group_size,
+                self.bits,
+                true,
             )?;
             let x_act = &mlx_rs::nn::silu(&x_gate)? * &x_up;
             let x_down = ffi::gather_qmm(
-                &x_act, &experts.down_weight, &experts.down_scales, &experts.down_biases,
-                &idx_sorted, true, self.group_size, self.bits, true,
+                &x_act,
+                &experts.down_weight,
+                &experts.down_scales,
+                &experts.down_biases,
+                &idx_sorted,
+                true,
+                self.group_size,
+                self.bits,
+                true,
             )?;
 
             // 8. Unsort + weighted sum
