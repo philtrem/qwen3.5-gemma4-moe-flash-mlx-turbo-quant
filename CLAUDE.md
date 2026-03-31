@@ -10,7 +10,7 @@ Detailed implementation history, decisions, and performance data are in the auto
 
 ## What this is
 
-Flash-loading inference engine for Qwen3.5-35B-A3B on Mac M4 base 16GB. All-Rust single binary via `mlx-rs`, on-demand expert loading via pread() or zero-copy mmap Metal buffers.
+Flash-loading inference engine for Qwen3.5-35B-A3B on Mac M4 base 16GB. All-Rust single binary via `mlx-rs`, on-demand expert loading via GCD prefetch + zero-copy mmap Metal buffers.
 
 ## Build
 
@@ -26,25 +26,24 @@ cargo build --release
   --model-path /Users/philtrem/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit \
   --output-path ./split_model_st
 
-# Generate (best config is the default — no flags needed)
+# Generate (default: GCD speculative + reactive prefetch, no warm set)
 ./target/release/flash-qwen generate \
   --model-path ./split_model_st \
   --tokenizer-path /Users/philtrem/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit \
   --prompt "Hello" --max-tokens 256
 
-# Negative flags to disable features:
-#   --no-speculate    Disable F_RDADVISE speculative prefetch
-#   --no-pipeline     Disable async_eval (use sync eval)
-#   --no-warm-set     Skip warm set loading at startup
-#   --kv-quant-bits 3 TurboQuant KV cache (3-bit)
+# Optional flags:
+#   --no-speculate    Disable speculative prefetch for predicted experts
+#   --warm-set        Load warm set at startup (preads frequent experts into page cache)
+#   --kv-quant-bits 3 TurboQuant KV cache (3-bit, ~30% slower)
 ```
 
 ## Architecture
 
 ### `src/`
-- **main.rs** — CLI (clap): split + generate subcommands. Reads quant config from config.json. All flags are negative (`--no-*`).
+- **main.rs** — CLI (clap): split + generate subcommands. Reads quant config from config.json.
 - **model/** — Model/TextModel/DecoderLayer, GatedDeltaNet, Attention, SparseMoeBlock, RMSNorm, MLP
-- **memory.rs** — ExpertMemoryManager: pread + zero-copy extraction, warm set pread prefetch, F_RDADVISE, double-buffered hybrid pread
+- **memory.rs** — ExpertMemoryManager: GCD prefetch (speculative/reactive with QoS + cancel), zero-copy mmap extraction, warm set pread, F_RDADVISE
 - **engine.rs** — generate() loop + nucleus sampling
 - **perf.rs** — PerfStats: per-phase timing accumulator (routing eval, layer eval, GPU wait, extract, routing CPU)
 - **ffi.rs** — gather_qmm FFI + `array_from_mmap` zero-copy wrapper
@@ -53,9 +52,9 @@ cargo build --release
 - **build.rs** — compiles ffi_zerocopy.cpp with MLX C++ headers
 
 ### I/O strategy (current default, USE_ZEROCOPY=true)
-- **Reactive blocking pread** (best config): After routing eval determines actual experts, `pread_experts_sync()` does parallel pread (global rayon pool, 12 threads) into throwaway buffers to warm page cache. Blocks until all pages resident. Then mmap zerocopy arrays are created — GPU eval is fault-free. Gated by `NOREACTIVE=1` env var for A/B testing.
-- **Speculative F_RDADVISE** (on by default, `--no-speculate` to disable): After reactive pread, `async_eval(h)` submits GPU. Then F_RDADVISE hints kernel to start reading L+1's predicted experts during GPU eval. **Net negative on 4-bit** in all tested variants — see exhaustive benchmark below.
-- **Warm set pread at startup**: `mlock_warm_set()` uses parallel pread (not madvise) to guarantee warm expert pages are resident. Saves ~20ms/tok on reactive pread (cache hits vs SSD).
+- **GCD reactive prefetch** (default): After routing eval determines actual experts, `prefetch_gcd_reactive()` dispatches F_RDADVISE + madvise(WILLNEED) + prefault touch per expert on GCD userInitiated queue. Blocks via dispatch_group until all pages resident. Then mmap zerocopy arrays are created — GPU eval is fault-free. Cancels any in-flight speculative workers first to avoid SSD contention. Gated by `NOREACTIVE=1` env var for A/B testing.
+- **GCD speculative prefetch** (on by default, `--no-speculate` to disable): After `async_eval(h)` submits GPU, `prefetch_gcd_speculative()` fires low-priority (utility QoS) F_RDADVISE + madvise + prefault for L+1's predicted experts. Cancellable via atomic flag — reactive cancels these when exact experts are known. Pages touched before cancellation remain in page cache.
+- **Warm set pread at startup** (opt-in, `--warm-set`): `mlock_warm_set()` uses parallel pread to guarantee warm expert pages are resident.
 - Per-layer eval via `async_eval` + `eval` separates GPU submission from wait time in perf stats.
 
 ### Model
@@ -74,34 +73,36 @@ cargo build --release
 
 ## Performance
 
-### Current best — 4-bit, reactive pread + warm set (no flags):
-- **50 tokens**: **7.5 tok/s** (implied 7.9), ramping to 8.4
-- Decode breakdown (127ms/tok): routing CPU/pread 55ms (43%), layer eval 32ms (25%), routing eval 30ms (24%), extract 11ms (9%)
-- GPU wait: 26ms (pure compute, zero faults)
-- Blocking pread ensures fault-free eval. Warm set cuts pread from 75ms to 55ms.
+### Current best — 4-bit, GCD reactive + speculative (default, no flags):
+- **50 tokens**: **7.7 tok/s** (implied 8.1), peaking at 8.7
+- Decode breakdown (123ms/tok): routing CPU/GCD prefetch 48ms (39%), routing eval 34ms (28%), layer eval 32ms (26%), extract 10ms (8%)
+- GPU wait: 27ms (pure compute, zero faults)
+- GCD reactive prefault ensures fault-free eval. Speculative warms pages before reactive runs.
+- With `--warm-set`: 7.0 tok/s (warm set preloads 63% of experts, but GCD speculative provides similar benefit)
+- With `--kv-quant-bits 3`: ~5.3 tok/s (Hadamard rotation adds ~12ms/tok on 10 attention layers)
 
 ### 4-bit benchmark matrix (50 tokens, M4 16GB):
-| Config | tok/s | Pread ms/tok | Layer eval ms/tok | GPU wait ms/tok |
-|--------|-------|-------------|-------------------|-----------------|
-| **Reactive + warm set** | **7.5→8.4** | **54.6** | **31.5** | **26.2** |
-| Reactive only, no warm set | 6.1→8.1 | 75.1 | 33.1 | 26.8 |
-| Reactive + F_RDADVISE spec | 6.9→7.6 | 62.4 | 31.1 | 16.4 |
+| Config | tok/s | Routing CPU ms/tok | Layer eval ms/tok | GPU wait ms/tok |
+|--------|-------|--------------------|-------------------|-----------------|
+| **GCD reactive + speculative (default)** | **7.7→8.7** | **47.5** | **31.7** | **26.6** |
+| GCD reactive + speculative + warm set | 7.0→7.9 | 58.7 | 32.5 | 28.9 |
+| pread reactive + warm set (old default) | 7.2→7.9 | 56.8 | 30.9 | 16.1 |
+| pread reactive, no warm set | 6.9 | 62.5 | 31.6 | 26.3 |
+| GCD reactive + speculative (no cancel) | 6.3 | 72.3 | 34.0 | 28.9 |
+| Old pipeline (speculative hybrid pread) | 4.8 | 31.8 | 111.4 | 0.0 |
 | Warm set only (no reactive) | 5.3→6.6 | 0.1 | 137.3 | 132.5 |
-| Reactive + main-thread pread spec | 4.7 | 33.7 | 112.7 | 1.0 |
-| Reactive + POSIX AIO spec | 4.7 | 34.8 | 112.5 | 34.0 |
-| Reactive + bg rayon spec (pre-alloc) | 4.5 | 35.4 | 118.1 | 33.8 |
-| Reactive + bg rayon spec (4-thread) | 5.3 | 42.3 | 94.3 | 29.6 |
-| Reactive + mincore+pread spec | 4.3 | 34.3 | 131.5 | 1.3 |
-| Reactive + madvise spec | 4.2 | 34.2 | 139.2 | 3.0 |
-| Speculative only (no reactive) | 3.9 | 0.1 | 195.7 | 130.4 |
 
-### Why speculative fails on 4-bit
+### GCD speculative + cancel: why it works on 4-bit
+- **Cancellation is key**: speculative fires on low-priority GCD utility queue during GPU eval (~0.65ms/layer). When reactive starts (after routing eval), it cancels speculative via atomic flag — no SSD contention.
+- Pages touched by speculative before cancellation remain in page cache, reducing reactive's work.
+- Without cancel: 6.3 tok/s (SSD contention). With cancel: 7.7 tok/s (clean handoff).
+- GCD QoS (utility vs userInitiated) provides OS-level thread priority differentiation.
+
+### Why pread-based speculative failed on 4-bit (historical)
 - Experts are 1.69 MB (small) — page cache retains them between tokens
-- GPU eval is ~0.65ms/layer — too short for speculative I/O to overlap meaningfully
-- ANY speculative overhead (even F_RDADVISE at ~0.5ms/tok) creates SSD contention with reactive pread
-- Speculative preading 12 experts to save on 8 reactive preads reads 50% more data than needed
-- Background par_iter is 2.3× slower than main-thread par_iter on macOS
-- Main-thread speculative overlaps GPU perfectly (GPU wait→1ms) but blocks the pipeline for 2.8ms/layer
+- GPU eval is ~0.65ms/layer — too short for blocking speculative I/O to overlap
+- Blocking pread for speculative can't be cancelled — always contends with reactive
+- Background rayon threads are 2.3× slower than main-thread on macOS
 
 ### 8-bit historical (Qwen3.5-35B-A3B-MLX-9bit, now deleted):
 - Default mmap zerocopy: 3.8 tok/s (warm cache), 1.8-2.0 tok/s (cold/degraded)
@@ -133,29 +134,32 @@ cargo build --release
 - **Do NOT load all expert files via load_safetensors** — causes swap storms on 16 GB
 - On-demand expert extraction via pread() is the correct approach
 - **pread() is 3.6× faster than mmap demand-paging** (page fault overhead: ~107μs/page for cold 16 KB random reads)
-- **Blocking pread before eval is the winning strategy**: pread at contiguous MB granularity warms page cache; subsequent mmap zerocopy eval runs fault-free. Saves 100-200ms/tok vs page faults during eval.
-- **madvise(MADV_WILLNEED) is unreliable** — returns before pages are loaded. Use pread to guarantee page residency.
+- **GCD reactive prefault before eval is the current strategy**: F_RDADVISE + madvise(WILLNEED) + prefault touch (one byte per 16 KB page) on GCD userInitiated queue. Blocks via dispatch_group. Equivalent to pread for page warming, with cancellation support.
+- **pread is also effective** (historical default): contiguous MB reads warm page cache; subsequent mmap zerocopy eval runs fault-free. Used at startup for warm set.
+- **madvise(MADV_WILLNEED) alone is unreliable** — returns before pages are loaded. Combined with prefault touch in GCD workers, it becomes reliable.
 - **mlock HURTS**: page table wire/unwire contends with GPU at kernel vm_map level.
-- **Speculative prefetch is a net negative on 4-bit** in ALL tested variants: pread (background pool, main thread, POSIX AIO, pre-alloc buffer), F_RDADVISE, madvise, mincore+pread. Every method either wastes time on already-cached pages or creates SSD contention with reactive pread. See benchmark matrix.
-- **F_RDADVISE** is the lightest speculative method (12 fcntl calls, ~0.5ms/tok) but still causes SSD contention with reactive pread (+8ms). Net negative on 4-bit. May help on 8-bit where experts are larger and GPU eval is longer.
+- **Pread-based speculative is a net negative on 4-bit** — can't be cancelled, always contends. See benchmark matrix.
+- **GCD speculative with cancellation works**: fire-and-forget prefault on utility queue, cancel via atomic when reactive starts. No SSD contention. +0.8 tok/s over no-speculate baseline.
 - Per-layer eval ensures expert arrays are freed after each layer (peak ~13.5 MB for 4-bit, not cumulative)
 - Expert LRU caching does NOT help — working set >> cache size on 16 GB
-- **Warm set pread at startup** (not madvise): guarantees 63% of expert pages are resident. Saves ~20ms/tok on reactive pread.
+- **Warm set pread at startup** (opt-in via `--warm-set`): guarantees 63% of expert pages are resident. Less impactful now that GCD speculative provides similar warming.
 
-### I/O architecture findings (2026-03-29/30):
-- **Page faults as flow control**: GPU self-throttles to match SSD throughput. Natural pipelining — but explicit pread is more efficient per byte.
-- **Speculative prefetch during eval causes SSD contention**: preads for L+1 compete with L's page faults or L+1's reactive pread. Consistently worse in all tested configurations.
-- **Background par_iter is ~2.3× slower than main-thread par_iter**. Cause unknown — likely SSD/kernel-level scheduling.
-- **async_eval pipeline** (explicit pread + async_eval overlap): I/O-compute overlap confirmed working (eval_wait=0ms). But pread throughput is the bottleneck, not overlap.
-- **The 2.7× pread gap** (8-bit): measured 400ms vs 150ms theoretical. Root cause: page cache can't hold warm set on 16 GB under memory pressure from 8-bit expert files. NOT per-call overhead (wrapping is 0.3ms for 108 Metal buffers).
+### I/O architecture findings (2026-03-29/30/31):
+- **Page faults as flow control**: GPU self-throttles to match SSD throughput. Natural pipelining — but explicit prefetch is more efficient per byte.
+- **Pread-based speculative during eval causes SSD contention**: can't be cancelled. Consistently worse in all tested configurations.
+- **GCD speculative with cancellation avoids contention**: atomic cancel flag lets reactive interrupt speculative. Pages already touched remain resident. Net positive (+0.8 tok/s).
+- **Background par_iter is ~2.3× slower than main-thread par_iter**. GCD dispatch avoids this penalty.
+- **Old pipeline (hybrid buffer pread between async_eval/eval) was always slower**: 4.8 tok/s vs 7.2 reactive-only. Removed.
+- **The 2.7× pread gap** (8-bit): measured 400ms vs 150ms theoretical. Root cause: page cache can't hold warm set on 16 GB under memory pressure from 8-bit expert files.
 
 ### Env vars for testing:
 - `NOREACTIVE=1` — skip reactive blocking pread (for A/B testing)
 
-### Speculative prefetch methods tested (all net negative on 4-bit):
-- **F_RDADVISE**: lightest (fcntl hint, ~0.5ms/tok). SSD contention with reactive.
-- **Main-thread pread**: perfect GPU overlap (wait=1ms) but 2.8ms/layer pread blocks pipeline.
-- **Background rayon pool (4-thread)**: 2.3× background-thread penalty on macOS.
+### Speculative prefetch methods tested:
+- **GCD cancellable prefault (current)**: fire-and-forget on utility queue, cancel via atomic when reactive starts. **Net positive** (+0.8 tok/s). The only method that avoids SSD contention.
+- **F_RDADVISE only**: lightest (fcntl hint, ~0.5ms/tok). SSD contention with reactive. Net negative.
+- **Main-thread pread**: perfect GPU overlap (wait=1ms) but 2.8ms/layer blocks pipeline. Net negative.
+- **Background rayon pool (4-thread)**: 2.3× background-thread penalty on macOS. Net negative.
 - **Background rayon (pre-alloc buffer)**: eliminating alloc didn't help — penalty is thread-level.
 - **Background rayon (global pool, 12-thread)**: CPU oversubscription (24 threads on 12 cores).
 - **POSIX AIO (aio_read)**: macOS emulates with kernel threads — same overhead as rayon.

@@ -28,7 +28,7 @@ enum Command {
         model_path: PathBuf,
         #[arg(long)]
         output_path: PathBuf,
-        /// Expert file format: "ecb" (expert-centric binary) or "safetensors"
+        /// Expert file format (only "ecb" is supported)
         #[arg(long, default_value = "ecb")]
         format: String,
     },

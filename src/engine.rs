@@ -24,7 +24,7 @@ pub fn generate(
 ) -> anyhow::Result<String> {
     let perf = PerfStats::new();
     let tp = RefCell::new(TransitionProfiler::new(40));
-    let input_ids = tokenizer.encode(prompt);
+    let input_ids = tokenizer.encode(prompt)?;
     let mut cache = model.make_cache(kv_quant_bits);
 
     // Prefill
@@ -54,7 +54,7 @@ pub fn generate(
     let mut generated: Vec<u32> = vec![next_token.item::<i32>() as u32];
     let mut stdout = std::io::stdout();
 
-    let text = tokenizer.decode(&generated);
+    let text = tokenizer.decode(&generated)?;
     print!("{}", text);
     stdout.flush().ok();
 
@@ -63,7 +63,7 @@ pub fn generate(
     mem.reset_cache_stats();
     let t_start = Instant::now();
     let mut t_interval = Instant::now();
-    let mut tokens_generated = 1usize;
+    let mut tokens_generated = 0usize;
     let mut prev_text_len = text.len();
 
     for _ in 1..max_tokens {
@@ -86,7 +86,7 @@ pub fn generate(
         tokens_generated += 1;
 
         // Stream
-        let full_text = tokenizer.decode(&generated);
+        let full_text = tokenizer.decode(&generated)?;
         if full_text.len() > prev_text_len {
             print!("{}", &full_text[prev_text_len..]);
             stdout.flush().ok();
@@ -135,7 +135,7 @@ pub fn generate(
     perf.report(tokens_generated);
     tp.borrow().report();
 
-    Ok(tokenizer.decode(&generated))
+    Ok(tokenizer.decode(&generated)?)
 }
 
 fn sample(logits: &Array, temperature: f32, top_p: f32) -> Result<Array, Exception> {

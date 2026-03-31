@@ -3,7 +3,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -125,8 +125,10 @@ pub struct ExpertMemoryManager {
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
-    // Cancellation token: set when reactive starts, causing speculative workers to bail.
-    speculative_cancel: Arc<AtomicBool>,
+    // Generation counter for speculative cancellation. Workers snapshot this on launch;
+    // cancel_speculative() bumps it, causing stale workers to bail without affecting
+    // the next batch.
+    speculative_generation: Arc<AtomicUsize>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -176,16 +178,20 @@ struct GcdPrefetchCtx {
     offset: usize,
     len: usize,
     group: usize,                         // dispatch_group_t as usize, 0 for fire-and-forget
-    cancel: Option<Arc<AtomicBool>>,      // if Some, bail when set (speculative only)
+    cancel_gen: Option<(Arc<AtomicUsize>, usize)>,  // (counter, snapshot) — bail if counter advanced
 }
 
 /// Unified GCD prefetch worker: F_RDADVISE + madvise(WILLNEED) + prefault touch.
-/// Cancellable via atomic flag (speculative path). Signals dispatch_group on
+/// Cancellable via generation counter (speculative path). Signals dispatch_group on
 /// completion if grouped (reactive path). Pages touched before cancellation
 /// remain in page cache.
 extern "C" fn gcd_prefetch_worker(ctx: *mut std::ffi::c_void) {
     let ctx = unsafe { Box::from_raw(ctx as *mut GcdPrefetchCtx) };
-    let cancelled = || ctx.cancel.as_ref().is_some_and(|c| c.load(Ordering::Acquire));
+    let cancelled = || {
+        ctx.cancel_gen.as_ref().is_some_and(|(counter, snapshot)| {
+            counter.load(Ordering::Acquire) != *snapshot
+        })
+    };
 
     if !cancelled() {
         issue_rdadvise(ctx.fd, ctx.offset, ctx.len);
@@ -375,7 +381,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                speculative_cancel: Arc::new(AtomicBool::new(false)),
+                speculative_generation: Arc::new(AtomicUsize::new(0)),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -395,7 +401,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                speculative_cancel: Arc::new(AtomicBool::new(false)),
+                speculative_generation: Arc::new(AtomicUsize::new(0)),
             })
         }
     }
@@ -663,7 +669,8 @@ impl ExpertMemoryManager {
 
     /// Speculative prefetch via GCD: fire-and-forget on low-priority utility queue.
     /// Issues F_RDADVISE + madvise(WILLNEED) + prefault touch per expert.
-    /// Each worker checks the cancellation token before I/O — reactive cancels these.
+    /// Each worker snapshots the generation counter — cancel_speculative() bumps it,
+    /// causing stale workers to bail without affecting the new batch.
     /// Pages already fetched by completed workers remain in page cache.
     pub fn prefetch_gcd_speculative(&self, layer: usize, expert_indices: &[i32]) {
         if layer >= self.files.len() {
@@ -673,8 +680,8 @@ impl ExpertMemoryManager {
             ExpertFormat::Ecb(infos) => &infos[layer],
             _ => return,
         };
-        // Reset cancel token for this new speculative batch
-        self.speculative_cancel.store(false, Ordering::Release);
+        // Snapshot current generation — workers will bail if it advances
+        let gen = self.speculative_generation.load(Ordering::Acquire);
 
         let fd = self.files[layer].as_raw_fd();
         let mmap_addr = self.maps[layer].as_ptr() as usize;
@@ -690,7 +697,7 @@ impl ExpertMemoryManager {
                 offset,
                 len: stride,
                 group: 0,
-                cancel: Some(Arc::clone(&self.speculative_cancel)),
+                cancel_gen: Some((Arc::clone(&self.speculative_generation), gen)),
             });
             unsafe {
                 dispatch_async_f(queue, Box::into_raw(ctx) as *mut std::ffi::c_void, gcd_prefetch_worker);
@@ -699,10 +706,10 @@ impl ExpertMemoryManager {
     }
 
     /// Cancel any in-flight speculative prefetch workers.
-    /// Workers check this flag before each I/O step and bail if set.
+    /// Bumps the generation counter — workers with older snapshots bail.
     /// Pages already fetched remain in page cache.
     pub fn cancel_speculative(&self) {
-        self.speculative_cancel.store(true, Ordering::Release);
+        self.speculative_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Reactive prefetch via GCD: high-priority userInitiated queue.
@@ -733,7 +740,7 @@ impl ExpertMemoryManager {
                 offset,
                 len: stride,
                 group: group as usize,
-                cancel: None,
+                cancel_gen: None,
             });
             unsafe {
                 dispatch_async_f(queue, Box::into_raw(ctx) as *mut std::ffi::c_void, gcd_prefetch_worker);

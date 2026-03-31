@@ -76,9 +76,10 @@ pub fn split_model(model_path: &Path, output_path: &Path, format: &str) -> io::R
     // Step 2: Write expert weights in requested format
     match format {
         "ecb" => write_expert_ecb(&shard_mmaps, weight_map, &expert_dir)?,
-        "safetensors" => write_expert_safetensors(&shard_mmaps, weight_map, &expert_dir)?,
+        "safetensors" => return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "safetensors expert format is no longer supported (inference requires ECB for zero-copy Metal buffers). Use --format ecb (the default).")),
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("unknown format '{}', expected 'ecb' or 'safetensors'", format))),
+            format!("unknown format '{}', expected 'ecb'", format))),
     }
 
     // Write split metadata

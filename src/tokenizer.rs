@@ -47,17 +47,17 @@ impl QwenTokenizer {
         })
     }
 
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.tokenizer
+    pub fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+        let enc = self.tokenizer
             .encode(text, false)
-            .map(|enc| enc.get_ids().to_vec())
-            .unwrap_or_default()
+            .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {}", e))?;
+        Ok(enc.get_ids().to_vec())
     }
 
-    pub fn decode(&self, ids: &[u32]) -> String {
+    pub fn decode(&self, ids: &[u32]) -> anyhow::Result<String> {
         self.tokenizer
             .decode(ids, true)
-            .unwrap_or_default()
+            .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {}", e))
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
