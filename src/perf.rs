@@ -14,7 +14,6 @@ pub struct PerfStats {
     // CPU work between evals
     pub extract_experts: Cell<u64>,   // pread I/O + from_raw_data (40/tok)
     pub routing_cpu: Cell<u64>,       // unique/sort/dedup/HashMap/remap + prefetch (40/tok)
-    pub sync_mlock: Cell<u64>,        // mlock blocking time before eval (30/tok, MoE only)
 }
 
 impl PerfStats {
@@ -27,7 +26,6 @@ impl PerfStats {
             eval_wait: Cell::new(0),
             extract_experts: Cell::new(0),
             routing_cpu: Cell::new(0),
-            sync_mlock: Cell::new(0),
         }
     }
 
@@ -43,7 +41,6 @@ impl PerfStats {
         self.eval_wait.set(0);
         self.extract_experts.set(0);
         self.routing_cpu.set(0);
-        self.sync_mlock.set(0);
     }
 
     pub fn report(&self, num_tokens: usize) {
@@ -54,7 +51,7 @@ impl PerfStats {
             + self.moe_routing_eval.get()
             + self.moe_sort_eval.get()
             + self.layer_eval.get();
-        let cpu_total = self.extract_experts.get() + self.routing_cpu.get() + self.sync_mlock.get();
+        let cpu_total = self.extract_experts.get() + self.routing_cpu.get();
         let total = evals_total + cpu_total;
 
         let pct = |ns: u64| if total > 0 { ns as f64 / total as f64 * 100.0 } else { 0.0 };
@@ -84,10 +81,6 @@ impl PerfStats {
             ms(self.extract_experts.get()), per_tok(self.extract_experts.get()), pct(self.extract_experts.get()));
         eprintln!("Routing CPU (×40):     {:>8.1}   {:>6.1}   {:>4.1}%",
             ms(self.routing_cpu.get()), per_tok(self.routing_cpu.get()), pct(self.routing_cpu.get()));
-        if self.sync_mlock.get() > 0 {
-            eprintln!("Sync mlock (×30):      {:>8.1}   {:>6.1}   {:>4.1}%",
-                ms(self.sync_mlock.get()), per_tok(self.sync_mlock.get()), pct(self.sync_mlock.get()));
-        }
         eprintln!("─────────────────────────────────────────────────");
         eprintln!("  CPU subtotal:        {:>8.1}   {:>6.1}   {:>4.1}%",
             ms(cpu_total), per_tok(cpu_total), pct(cpu_total));

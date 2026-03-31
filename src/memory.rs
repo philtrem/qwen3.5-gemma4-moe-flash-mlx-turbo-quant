@@ -1,10 +1,10 @@
-use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use mlx_rs::{Array, Dtype};
@@ -119,19 +119,14 @@ pub struct SingleExpertTensors {
 /// ECB is auto-detected by probing for .ecb files; falls back to safetensors.
 #[allow(dead_code)]
 pub struct ExpertMemoryManager {
-    files: Vec<File>,       // for pread() extraction
-    maps: Vec<Mmap>,        // for warm set madvise only
+    files: Vec<File>,
+    maps: Vec<Mmap>,
     format: ExpertFormat,
     warm_set: HashSet<(u32, u32)>,
     hits: AtomicUsize,
     misses: AtomicUsize,
-    // Double-buffered page-aligned buffers for hybrid pread+zerocopy path.
-    // Two buffers alternate: one is written by AIO while the GPU reads the other.
-    hybrid_bufs: [*mut u8; 2],
-    hybrid_buf_layout: std::alloc::Layout,
-    hybrid_write_idx: Cell<usize>,
-    // Preloaded expert data from AIO pipeline (consumed by moe.rs forward)
-    preloaded_ready: RefCell<Option<(usize, Vec<i32>, Vec<SingleExpertTensors>)>>,
+    // Cancellation token: set when reactive starts, causing speculative workers to bail.
+    speculative_cancel: Arc<AtomicBool>,
 }
 
 // ── F_RDADVISE FFI (macOS) ──────────────────────────────────────────────────
@@ -151,6 +146,71 @@ fn issue_rdadvise(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
     };
     unsafe {
         libc::fcntl(fd, F_RDADVISE, &mut advice);
+    }
+}
+
+// ── GCD FFI (macOS) ────────────────────────────────────────────────────────
+
+extern "C" {
+    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut std::ffi::c_void;
+    fn dispatch_group_create() -> *mut std::ffi::c_void;
+    fn dispatch_group_enter(group: *mut std::ffi::c_void);
+    fn dispatch_group_leave(group: *mut std::ffi::c_void);
+    fn dispatch_group_wait(group: *mut std::ffi::c_void, timeout: u64) -> isize;
+    fn dispatch_async_f(
+        queue: *mut std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
+    fn dispatch_release(object: *mut std::ffi::c_void);
+}
+
+const QOS_CLASS_USER_INITIATED: isize = 0x19;
+const QOS_CLASS_UTILITY: isize = 0x11;
+const DISPATCH_TIME_FOREVER: u64 = !0;
+
+/// Context for a GCD prefetch task. Box'd and transferred via raw pointer.
+struct GcdPrefetchCtx {
+    fd: i32,
+    mmap_addr: usize,
+    offset: usize,
+    len: usize,
+    group: usize,                         // dispatch_group_t as usize, 0 for fire-and-forget
+    cancel: Option<Arc<AtomicBool>>,      // if Some, bail when set (speculative only)
+}
+
+/// Unified GCD prefetch worker: F_RDADVISE + madvise(WILLNEED) + prefault touch.
+/// Cancellable via atomic flag (speculative path). Signals dispatch_group on
+/// completion if grouped (reactive path). Pages touched before cancellation
+/// remain in page cache.
+extern "C" fn gcd_prefetch_worker(ctx: *mut std::ffi::c_void) {
+    let ctx = unsafe { Box::from_raw(ctx as *mut GcdPrefetchCtx) };
+    let cancelled = || ctx.cancel.as_ref().is_some_and(|c| c.load(Ordering::Acquire));
+
+    if !cancelled() {
+        issue_rdadvise(ctx.fd, ctx.offset, ctx.len);
+    }
+
+    if !cancelled() {
+        unsafe {
+            libc::madvise(
+                (ctx.mmap_addr + ctx.offset) as *mut libc::c_void,
+                ctx.len,
+                libc::MADV_WILLNEED,
+            );
+        }
+
+        let base = ctx.mmap_addr + ctx.offset;
+        let mut off = 0;
+        while off < ctx.len {
+            if cancelled() { break; }
+            unsafe { std::ptr::read_volatile((base + off) as *const u8) };
+            off += 16384;
+        }
+    }
+
+    if ctx.group != 0 {
+        unsafe { dispatch_group_leave(ctx.group as *mut std::ffi::c_void) };
     }
 }
 
@@ -308,17 +368,6 @@ impl ExpertMemoryManager {
                 maps.push(mmap);
                 files.push(pread_file);
             }
-            // Allocate double-buffered page-aligned buffers for hybrid pread+zerocopy
-            let max_stride = ecb_infos.iter().map(|i| i.per_expert_stride).max().unwrap_or(0);
-            let hybrid_buf_size = 16 * max_stride;
-            let hybrid_buf_layout = std::alloc::Layout::from_size_align(hybrid_buf_size, 16384)
-                .expect("invalid layout for hybrid buffer");
-            let hybrid_buf_a = unsafe { std::alloc::alloc(hybrid_buf_layout) };
-            let hybrid_buf_b = unsafe { std::alloc::alloc(hybrid_buf_layout) };
-            if hybrid_buf_a.is_null() || hybrid_buf_b.is_null() {
-                std::alloc::handle_alloc_error(hybrid_buf_layout);
-            }
-
             Ok(Self {
                 files,
                 maps,
@@ -326,10 +375,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                hybrid_bufs: [hybrid_buf_a, hybrid_buf_b],
-                hybrid_buf_layout,
-                hybrid_write_idx: Cell::new(0),
-                preloaded_ready: RefCell::new(None),
+                speculative_cancel: Arc::new(AtomicBool::new(false)),
             })
         } else {
             let mut st_offsets = Vec::with_capacity(num_layers);
@@ -349,10 +395,7 @@ impl ExpertMemoryManager {
                 warm_set: HashSet::new(),
                 hits: AtomicUsize::new(0),
                 misses: AtomicUsize::new(0),
-                hybrid_bufs: [std::ptr::null_mut(), std::ptr::null_mut()],
-                hybrid_buf_layout: std::alloc::Layout::from_size_align(1, 1).unwrap(),
-                hybrid_write_idx: Cell::new(0),
-                preloaded_ready: RefCell::new(None),
+                speculative_cancel: Arc::new(AtomicBool::new(false)),
             })
         }
     }
@@ -392,11 +435,7 @@ impl ExpertMemoryManager {
         (warm, cold)
     }
 
-    /// Parallel pread of specific experts to warm the page cache.
-    /// Blocks until all pages are in the kernel page cache. Uses the caller's
-    /// rayon pool (global pool from main thread = 12 threads) for maximum
-    /// NVMe queue depth. Uses hybrid_bufs[0] as a pre-allocated, page-aligned
-    /// destination to avoid per-expert Vec allocation on the hot path.
+    /// Parallel pread to warm the page cache. Used at startup for warm set prefetch.
     pub fn pread_experts_sync(&self, layer: usize, expert_indices: &[i32]) {
         match &self.format {
             ExpertFormat::Ecb(infos) => {
@@ -404,30 +443,12 @@ impl ExpertMemoryManager {
                 let file = &self.files[layer];
                 let stride = info.per_expert_stride;
                 let data_start = info.data_start;
-                let n = expert_indices.len();
-                if !self.hybrid_bufs[0].is_null() && n * stride <= self.hybrid_buf_layout.size() {
-                    // Use hybrid_bufs[0] as throwaway destination (pre-allocated, page-aligned).
-                    // Each thread writes to a non-overlapping region.
-                    let buf_addr = self.hybrid_bufs[0] as usize;
-                    expert_indices.par_iter().enumerate().for_each(|(i, &eidx)| {
-                        let offset = data_start as u64 + eidx as u64 * stride as u64;
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (buf_addr + i * stride) as *mut u8,
-                                stride,
-                            )
-                        };
-                        file.read_exact_at(dst, offset).expect("pread failed");
-                    });
-                } else {
-                    // Safetensors fallback: allocate per-expert
-                    expert_indices.par_iter().for_each(|&eidx| {
-                        let offset = data_start as u64 + eidx as u64 * stride as u64;
-                        let mut buf = Vec::with_capacity(stride);
-                        unsafe { buf.set_len(stride); }
-                        let _ = file.read_exact_at(&mut buf, offset);
-                    });
-                }
+                expert_indices.par_iter().for_each(|&eidx| {
+                    let offset = data_start as u64 + eidx as u64 * stride as u64;
+                    let mut buf = Vec::with_capacity(stride);
+                    unsafe { buf.set_len(stride); }
+                    let _ = file.read_exact_at(&mut buf, offset);
+                });
             }
             _ => {}
         }
@@ -640,99 +661,97 @@ impl ExpertMemoryManager {
         }
     }
 
-    /// Hybrid pread+zerocopy: parallel pread into pre-allocated buffer,
-    /// then wrap slices as zero-copy Metal arrays via newBufferWithBytesNoCopy.
-    ///
-    /// Eliminates page faults entirely: explicit I/O at high NVMe queue depth
-    /// (one pread per expert in parallel via rayon) followed by zero-copy GPU access.
-    ///
-    /// Safety: the hybrid buffer is reused across layers. Per-layer eval barriers
-    /// in model forward guarantee previous data is consumed before overwrite.
-    pub fn extract_experts_hybrid(&self, layer: usize, expert_indices: &[i32]) -> Vec<SingleExpertTensors> {
+    /// Speculative prefetch via GCD: fire-and-forget on low-priority utility queue.
+    /// Issues F_RDADVISE + madvise(WILLNEED) + prefault touch per expert.
+    /// Each worker checks the cancellation token before I/O — reactive cancels these.
+    /// Pages already fetched by completed workers remain in page cache.
+    pub fn prefetch_gcd_speculative(&self, layer: usize, expert_indices: &[i32]) {
+        if layer >= self.files.len() {
+            return;
+        }
         let info = match &self.format {
             ExpertFormat::Ecb(infos) => &infos[layer],
-            ExpertFormat::Safetensors(_) => panic!("hybrid requires ECB format"),
+            _ => return,
         };
-        let n = expert_indices.len();
+        // Reset cancel token for this new speculative batch
+        self.speculative_cancel.store(false, Ordering::Release);
+
+        let fd = self.files[layer].as_raw_fd();
+        let mmap_addr = self.maps[layer].as_ptr() as usize;
         let stride = info.per_expert_stride;
-        let total = n * stride;
-        assert!(
-            total <= self.hybrid_buf_layout.size(),
-            "hybrid buffer too small: need {} bytes for {} experts",
-            total, n
-        );
-
-        let write_idx = self.hybrid_write_idx.get();
-        let file = &self.files[layer];
-        let buf_addr = self.hybrid_bufs[write_idx] as usize;
         let data_start = info.data_start;
+        let queue = unsafe { dispatch_get_global_queue(QOS_CLASS_UTILITY, 0) };
 
-        // Parallel pread: one contiguous read per expert, high NVMe queue depth.
-        // Each thread writes to a non-overlapping region of the buffer.
-        expert_indices.par_iter().enumerate().for_each(|(i, &eidx)| {
-            let file_offset = data_start as u64 + eidx as u64 * stride as u64;
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut((buf_addr + i * stride) as *mut u8, stride)
-            };
-            file.read_exact_at(dst, file_offset).expect("pread failed");
-        });
-
-        // Wrap buffer slices as zero-copy Metal arrays (no data copy, no page faults)
-        let buf_ptr = self.hybrid_bufs[write_idx];
-        // Toggle write buffer for next use
-        self.hybrid_write_idx.set(1 - write_idx);
-        expert_indices.iter().enumerate().map(|(i, _)| {
-            let expert_base = i * stride;
-            let mut arrays = Vec::with_capacity(9);
-            for tensor in &info.tensors {
-                let offset = expert_base + tensor.offset_within_expert;
-                let arr = unsafe {
-                    crate::ffi::array_from_mmap(
-                        buf_ptr,
-                        offset,
-                        tensor.stride,
-                        &tensor.expert_shape,
-                        tensor.dtype,
-                    )
-                };
-                arrays.push(arr);
-            }
-            SingleExpertTensors {
-                gate_weight: arrays.remove(0),
-                gate_scales: arrays.remove(0),
-                gate_biases: arrays.remove(0),
-                up_weight: arrays.remove(0),
-                up_scales: arrays.remove(0),
-                up_biases: arrays.remove(0),
-                down_weight: arrays.remove(0),
-                down_scales: arrays.remove(0),
-                down_biases: arrays.remove(0),
-            }
-        }).collect()
-    }
-
-    /// Store preloaded expert data for consumption by moe.rs forward.
-    pub fn set_preloaded(
-        &self,
-        layer: usize,
-        expert_indices: Vec<i32>,
-        batch: Vec<SingleExpertTensors>,
-    ) {
-        *self.preloaded_ready.borrow_mut() = Some((layer, expert_indices, batch));
-    }
-
-    /// Take preloaded expert data if available for the given layer.
-    pub fn take_preloaded(
-        &self,
-        layer: usize,
-    ) -> Option<(Vec<i32>, Vec<SingleExpertTensors>)> {
-        let mut preloaded = self.preloaded_ready.borrow_mut();
-        if let Some((l, _, _)) = preloaded.as_ref() {
-            if *l == layer {
-                return preloaded.take().map(|(_, idx, batch)| (idx, batch));
+        for &eidx in expert_indices {
+            let offset = data_start + eidx as usize * stride;
+            let ctx = Box::new(GcdPrefetchCtx {
+                fd,
+                mmap_addr,
+                offset,
+                len: stride,
+                group: 0,
+                cancel: Some(Arc::clone(&self.speculative_cancel)),
+            });
+            unsafe {
+                dispatch_async_f(queue, Box::into_raw(ctx) as *mut std::ffi::c_void, gcd_prefetch_worker);
             }
         }
-        None
+    }
+
+    /// Cancel any in-flight speculative prefetch workers.
+    /// Workers check this flag before each I/O step and bail if set.
+    /// Pages already fetched remain in page cache.
+    pub fn cancel_speculative(&self) {
+        self.speculative_cancel.store(true, Ordering::Release);
+    }
+
+    /// Reactive prefetch via GCD: high-priority userInitiated queue.
+    /// Cancels speculative first so it doesn't contend on SSD.
+    /// Issues F_RDADVISE + madvise(WILLNEED) + prefault touch per expert.
+    /// Returns a dispatch_group handle — caller must call wait_prefetch_group().
+    pub fn prefetch_gcd_reactive(&self, layer: usize, expert_indices: &[i32]) -> *mut std::ffi::c_void {
+        // Cancel speculative — we now know the exact experts, no contention wanted
+        self.cancel_speculative();
+
+        let info = match &self.format {
+            ExpertFormat::Ecb(infos) => &infos[layer],
+            _ => return std::ptr::null_mut(),
+        };
+        let fd = self.files[layer].as_raw_fd();
+        let mmap_addr = self.maps[layer].as_ptr() as usize;
+        let stride = info.per_expert_stride;
+        let data_start = info.data_start;
+        let group = unsafe { dispatch_group_create() };
+        let queue = unsafe { dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0) };
+
+        for &eidx in expert_indices {
+            let offset = data_start + eidx as usize * stride;
+            unsafe { dispatch_group_enter(group) };
+            let ctx = Box::new(GcdPrefetchCtx {
+                fd,
+                mmap_addr,
+                offset,
+                len: stride,
+                group: group as usize,
+                cancel: None,
+            });
+            unsafe {
+                dispatch_async_f(queue, Box::into_raw(ctx) as *mut std::ffi::c_void, gcd_prefetch_worker);
+            }
+        }
+
+        group
+    }
+
+    /// Block until reactive prefetch group completes, then release it.
+    pub fn wait_prefetch_group(&self, group: *mut std::ffi::c_void) {
+        if group.is_null() {
+            return;
+        }
+        unsafe {
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+            dispatch_release(group);
+        }
     }
 
     /// Prefetch warm set into page cache via parallel pread (guaranteed resident).
@@ -763,15 +782,5 @@ impl ExpertMemoryManager {
         }
 
         total_bytes
-    }
-}
-
-impl Drop for ExpertMemoryManager {
-    fn drop(&mut self) {
-        for buf in &self.hybrid_bufs {
-            if !buf.is_null() {
-                unsafe { std::alloc::dealloc(*buf, self.hybrid_buf_layout); }
-            }
-        }
     }
 }

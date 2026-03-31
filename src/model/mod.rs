@@ -47,7 +47,6 @@ impl DecoderLayer {
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
         next_layer_gate: Option<(&QuantizedLinear, &norm::RMSNorm)>,
-        sync_mlock: bool,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -61,7 +60,7 @@ impl DecoderLayer {
         };
         let h = x + &attn_out;
         let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed, mem, perf, next_layer_gate, sync_mlock, tp)?;
+        let mlp_out = self.mlp.forward(&normed, mem, perf, next_layer_gate, tp)?;
         Ok(&h + &mlp_out)
     }
 }
@@ -85,7 +84,6 @@ impl TextModel {
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
         speculate: bool,
-        sync_mlock: bool,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let flat_ids = input_ids.flatten(None, None)?;
@@ -104,14 +102,11 @@ impl TextModel {
 
         let mut h = hidden;
         let num_layers = self.layers.len();
-        let is_decode = input_ids.dim(1) == 1;
-        let use_pipeline = sync_mlock && speculate && is_decode;
-        let need_predictions = speculate || use_pipeline;
 
         for i in 0..num_layers {
             let (head, tail) = self.layers.split_at_mut(i + 1);
             let layer = &mut head[i];
-            let next_gate_ln = if need_predictions {
+            let next_gate_ln = if speculate {
                 tail.first()
                     .map(|next| (&next.mlp.gate, &next.post_attention_layernorm))
             } else {
@@ -122,61 +117,30 @@ impl TextModel {
             } else {
                 fa_mask.as_ref()
             };
-            h = layer.forward(&h, mask, &mut cache[i], mem, perf, next_gate_ln, sync_mlock, tp)?;
+            h = layer.forward(&h, mask, &mut cache[i], mem, perf, next_gate_ln, tp)?;
 
-            if use_pipeline && i + 1 < num_layers {
-                let _t = Instant::now();
-                mlx_rs::transforms::async_eval(std::iter::once(&h))?;
-                let async_dur = _t.elapsed();
+            let _t = Instant::now();
+            mlx_rs::transforms::async_eval(std::iter::once(&h))?;
 
-                // Main thread preads next layer's predicted experts while GPU runs
-                let _t2 = Instant::now();
+            // Speculative prefetch via GCD utility queue (low priority, fire-and-forget).
+            // Issues F_RDADVISE + madvise(WILLNEED) + prefault touch for predicted experts.
+            // Runs during GPU eval — pages that become resident reduce reactive work at L+1.
+            if speculate && i + 1 < num_layers {
                 if let Some(tp_ref) = tp {
                     let tp_borrow = tp_ref.borrow();
                     if let Some((pred_layer, ref predicted)) = tp_borrow.pending_prediction {
                         if pred_layer == i + 1 {
-                            let batch = mem.extract_experts_hybrid(i + 1, predicted);
-                            mem.set_preloaded(i + 1, predicted.clone(), batch);
+                            mem.prefetch_gcd_speculative(pred_layer, predicted);
                         }
                     }
                 }
-                let pread_dur = _t2.elapsed();
-
-                // Wait for GPU to finish
-                let _t3 = Instant::now();
-                mlx_rs::transforms::eval(std::iter::once(&h))?;
-                let eval_dur = _t3.elapsed();
-
-                if i < 3 {
-                    eprintln!("  L{}: async_eval={:.1}ms pread={:.1}ms eval_wait={:.1}ms",
-                        i, async_dur.as_secs_f64()*1000.0,
-                        pread_dur.as_secs_f64()*1000.0,
-                        eval_dur.as_secs_f64()*1000.0);
-                }
-                perf.acc(&perf.layer_eval, _t.elapsed());
-            } else {
-                let _t = Instant::now();
-                mlx_rs::transforms::async_eval(std::iter::once(&h))?;
-
-                // Speculative prefetch: F_RDADVISE for predicted experts.
-                // Lightest hint — just fcntl per expert, no page table walks.
-                if speculate && i + 1 < num_layers {
-                    if let Some(tp_ref) = tp {
-                        let tp_borrow = tp_ref.borrow();
-                        if let Some((pred_layer, ref predicted)) = tp_borrow.pending_prediction {
-                            if pred_layer == i + 1 {
-                                mem.prefetch_experts(pred_layer, predicted);
-                            }
-                        }
-                    }
-                }
-
-                let _tw = Instant::now();
-                mlx_rs::transforms::eval(std::iter::once(&h))?;
-                perf.acc(&perf.eval_wait, _tw.elapsed());
-
-                perf.acc(&perf.layer_eval, _t.elapsed());
             }
+
+            let _tw = Instant::now();
+            mlx_rs::transforms::eval(std::iter::once(&h))?;
+            perf.acc(&perf.eval_wait, _tw.elapsed());
+
+            perf.acc(&perf.layer_eval, _t.elapsed());
         }
 
         self.norm.forward(&h)
@@ -198,10 +162,9 @@ impl Model {
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
         speculate: bool,
-        sync_mlock: bool,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
-        let out = self.model.forward(input_ids, cache, mem, perf, speculate, sync_mlock, tp)?;
+        let out = self.model.forward(input_ids, cache, mem, perf, speculate, tp)?;
         if self.tie_word_embeddings {
             mlx_rs::ops::quantized_matmul(
                 &out,

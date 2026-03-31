@@ -106,7 +106,6 @@ impl SparseMoeBlock {
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
         next_layer_gate: Option<(&QuantizedLinear, &RMSNorm)>,
-        sync_preload: bool,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
@@ -182,12 +181,13 @@ impl SparseMoeBlock {
             .map(|(i, &orig)| (orig, i as i32))
             .collect();
 
-        // Blocking prefetch: parallel pread all experts to warm page cache.
-        // Prevents page faults during eval — pread at contiguous MB granularity
-        // is far more efficient than 16KB page fault traps.
+        // Reactive prefetch via GCD userInitiated queue:
+        // F_RDADVISE + madvise(WILLNEED) + prefault touch per expert.
+        // Blocks until all pages are resident — zero page faults during eval.
         // Skip if NOREACTIVE=1 (for A/B testing).
         if is_decode && !*NOREACTIVE.get_or_init(|| std::env::var("NOREACTIVE").is_ok()) {
-            mem.pread_experts_sync(self.layer_idx, &unique);
+            let group = mem.prefetch_gcd_reactive(self.layer_idx, &unique);
+            mem.wait_prefetch_group(group);
         }
 
         // Pre-compute per-expert score weights (for zero-copy path)
@@ -224,39 +224,9 @@ impl SparseMoeBlock {
         if USE_ZEROCOPY {
             let _t = Instant::now();
 
-            // Use preloaded experts (from async_eval pipeline) or fall back to zerocopy
-            let preloaded = mem.take_preloaded(self.layer_idx);
-            let experts: Vec<SingleExpertTensors> = if let Some((_pre_idx, pre_batch)) = preloaded {
-                // Preloaded from hybrid buffer — fault-free.
-                // Handle prediction misses via hybrid pread into spare buffer.
-                let mut pre_opts: Vec<Option<SingleExpertTensors>> =
-                    pre_batch.into_iter().map(Some).collect();
-                let mut result: Vec<Option<SingleExpertTensors>> = Vec::with_capacity(unique.len());
-                let mut misses: Vec<(usize, i32)> = Vec::new();
-                for (i, &eidx) in unique.iter().enumerate() {
-                    if let Some(pos) = _pre_idx.iter().position(|&e| e == eidx) {
-                        if let Some(expert) = pre_opts[pos].take() {
-                            result.push(Some(expert));
-                            continue;
-                        }
-                    }
-                    misses.push((i, eidx));
-                    result.push(None);
-                }
-                if !misses.is_empty() {
-                    let miss_indices: Vec<i32> = misses.iter().map(|(_, e)| *e).collect();
-                    let miss_experts = mem.extract_experts_hybrid(self.layer_idx, &miss_indices);
-                    let mut miss_iter = miss_experts.into_iter();
-                    for (i, _) in &misses {
-                        result[*i] = Some(miss_iter.next().unwrap());
-                    }
-                }
-                result.into_iter().map(|o| o.unwrap()).collect()
-            } else if sync_preload && is_decode {
-                // Pipeline mode, no preloaded data (layer 0): sync hybrid extract
-                mem.extract_experts_hybrid(self.layer_idx, &unique)
-            } else {
-                // Prefill or non-pipeline decode: mmap zerocopy
+            // Zero-copy extract: Metal arrays backed by mmap'd memory.
+            // Reactive pread above warms page cache to minimize page faults.
+            let experts: Vec<SingleExpertTensors> = {
                 let mut v = Vec::with_capacity(unique.len());
                 for &eidx in &unique {
                     v.push(mem.extract_expert_zerocopy(self.layer_idx, eidx));

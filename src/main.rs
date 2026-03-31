@@ -54,12 +54,9 @@ enum Command {
         /// Disable speculative F_RDADVISE prefetch for next-layer predicted experts.
         #[arg(long)]
         no_speculate: bool,
-        /// Disable async_eval pipeline (use sync eval instead).
+        /// Load warm set at startup (preads frequent experts into page cache).
         #[arg(long)]
-        no_pipeline: bool,
-        /// Skip warm set loading at startup.
-        #[arg(long)]
-        no_warm_set: bool,
+        warm_set: bool,
     },
 }
 
@@ -87,8 +84,7 @@ fn main() -> anyhow::Result<()> {
             warm_experts,
             kv_quant_bits,
             no_speculate,
-            no_pipeline,
-            no_warm_set,
+            warm_set,
         } => {
             // Load config
             let config_path = model_path.join("config.json");
@@ -126,7 +122,7 @@ fn main() -> anyhow::Result<()> {
                     if auto.exists() { Some(auto) } else { None }
                 });
 
-            if let Some(wp) = warm_path.filter(|_| !no_warm_set) {
+            if let Some(wp) = warm_path.filter(|_| warm_set) {
                 eprintln!("Prefetching warm set from {}...", wp.display());
                 let warm: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&wp)?)?;
@@ -154,13 +150,9 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("TurboQuant KV cache: {}-bit", bits);
             }
             let speculate = !no_speculate;
-            let sync_mlock = !no_pipeline;
             eprintln!("Engine ready.\n");
             if no_speculate {
                 eprintln!("Speculative prediction: disabled");
-            }
-            if no_pipeline {
-                eprintln!("Pipeline: disabled (sync eval)");
             }
             let _output = engine::generate(
                 &mut model,
@@ -172,7 +164,6 @@ fn main() -> anyhow::Result<()> {
                 &mem_mgr,
                 kv_quant_bits,
                 speculate,
-                sync_mlock,
             )?;
         }
     }

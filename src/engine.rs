@@ -21,7 +21,6 @@ pub fn generate(
     mem: &ExpertMemoryManager,
     kv_quant_bits: Option<u8>,
     speculate: bool,
-    sync_mlock: bool,
 ) -> anyhow::Result<String> {
     let perf = PerfStats::new();
     let tp = RefCell::new(TransitionProfiler::new(40));
@@ -35,7 +34,7 @@ pub fn generate(
         &input_ids.iter().map(|&x| x as i32).collect::<Vec<_>>(),
         &[1, input_ids.len() as i32],
     );
-    let logits = model.forward(&input, &mut cache, mem, &perf, false, false, None)?;
+    let logits = model.forward(&input, &mut cache, mem, &perf, false, None)?;
     mlx_rs::transforms::eval(std::iter::once(&logits))?;
     let prefill_time = t0.elapsed();
     eprintln!(
@@ -75,7 +74,7 @@ pub fn generate(
         }
 
         let input = Array::from_slice(&[tok_id as i32], &[1, 1]);
-        let logits = model.forward(&input, &mut cache, mem, &perf, speculate, sync_mlock, Some(&tp))?;
+        let logits = model.forward(&input, &mut cache, mem, &perf, speculate, Some(&tp))?;
         let logits = mlx_rs::ops::squeeze_axes(&logits, &[1])?;
         next_token = sample(&logits, temperature, top_p)?;
         mlx_rs::transforms::eval(std::iter::once(&next_token))?;
