@@ -4,6 +4,8 @@ All-Rust inference engine for [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen
 
 The key idea: Qwen3.5-35B-A3B only activates 3B parameters per token (8 of 256 experts per layer), so the full model doesn't need to fit in memory. flash-qwen keeps resident weights in Metal buffers and loads experts on-demand from SSD via memory-mapped I/O, using GCD-dispatched prefetch to keep pages ahead of the GPU.
 
+While built around Qwen3.5, the engine is designed as a foundation for serving large MoE models on M-series Macs — the SSD prefetch pipeline, zero-copy Metal path, and on-demand expert loading are model-agnostic.
+
 ## Architecture
 
 ```
@@ -44,7 +46,7 @@ The key idea: Qwen3.5-35B-A3B only activates 3B parameters per token (8 of 256 e
 
 ### I/O pipeline
 
-The bottleneck isn't compute — it's getting expert bytes from SSD to GPU before it stalls. flash-qwen uses a two-stage GCD prefetch pipeline:
+The bottleneck isn't compute — it's getting expert bytes from SSD to GPU before it stalls. Without explicit prefetch, the GPU triggers page faults that pull data in 16 KB chunks — synchronous kernel traps that reduce effective SSD throughput to a fraction of what sequential reads achieve. flash-qwen avoids this with a two-stage GCD prefetch pipeline:
 
 1. **Speculative** (during GPU eval): After submitting the current layer to the GPU, fire off low-priority (utility QoS) GCD workers to prefault pages for the *next* layer's predicted experts. Uses routing pre-MoE signals for ~85% accuracy.
 2. **Reactive** (after routing): Once the router picks the actual 8 experts, cancel any in-flight speculative work (generation counter — no SSD contention), then dispatch high-priority (userInitiated QoS) workers to prefault the exact pages needed. Blocks until all pages are resident.
