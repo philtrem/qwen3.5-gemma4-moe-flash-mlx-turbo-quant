@@ -118,6 +118,8 @@ On a 16 GB machine, the resident weights plus OS overhead leave roughly 10-12 GB
 
 The M4's ANE isn't useful here. I/O is the bottleneck — even instant compute wouldn't dramatically change throughput. But beyond that, ANE doesn't support 4-bit quantized matmul (it handles float16/int8 via CoreML), so you'd have to dequantize to float16 first, doubling memory traffic. ANE dispatch latency is also tuned for large-batch CoreML inference, not single-token autoregressive decode where GPU compute is already a minority of wall time.
 
+That said, on higher-spec M-series machines (more RAM, faster SSD) or with models where compute becomes the bottleneck instead of I/O, offloading to the ANE could become worthwhile.
+
 ## License
 
 MIT
