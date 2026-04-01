@@ -88,42 +88,58 @@ fn lloyd_max_codebook(bits: u8) -> (&'static [f32], &'static [f32]) {
     }
 }
 
-/// Quantize: normalize → rotate → scale → boundary search.
-/// Input x: [B, H, T, D]. Returns (indices: [B, H, T, D] uint8, norms: [B, H, T, 1] f32).
-fn turbo_quantize(
-    x: &Array,
+/// Quantize K and V together: concat along heads, one pipeline, split back.
+/// keys/values: [B, H, T, D]. Returns ((ki, kn), (vi, vn)) with indices uint8, norms f32.
+fn turbo_quantize_kv(
+    keys: &Array,
+    values: &Array,
     config: &TurboQuantConfig,
-) -> Result<(Array, Array), Exception> {
-    let x = x.as_dtype(mlx_rs::Dtype::Float32)?;
+) -> Result<((Array, Array), (Array, Array)), Exception> {
+    let num_kv_heads = keys.dim(1);
 
-    let x_sq = &x * &x;
-    let sum_sq = mlx_rs::ops::sum_axis(&x_sq, -1, Some(true))?;
+    // [B, 2H, T, D]
+    let kv = mlx_rs::ops::concatenate_axis(&[keys, values], 1)?;
+    let kv = kv.as_dtype(mlx_rs::Dtype::Float32)?;
+
+    let kv_sq = &kv * &kv;
+    let sum_sq = mlx_rs::ops::sum_axis(&kv_sq, -1, Some(true))?;
     let norm = mlx_rs::ops::sqrt(&sum_sq)?;
 
     let eps = Array::from_f32(1e-8);
-    let x_unit = &x / &(&norm + &eps);
-    let x_rot = mlx_rs::ops::matmul(&x_unit, &config.rotation)?;
+    let kv_unit = &kv / &(&norm + &eps);
+    let kv_rot = mlx_rs::ops::matmul(&kv_unit, &config.rotation)?;
 
-    // Scale to ~N(0,1) for codebook lookup
     let scale = Array::from_f32(config.sqrt_d);
-    let x_scaled = &x_rot * &scale;
+    let kv_scaled = &kv_rot * &scale;
 
-    // MLX has no searchsorted — use boundary comparison
-    let x_exp = mlx_rs::ops::expand_dims(&x_scaled, -1)?;
-    let cmp = x_exp.ge(&config.boundaries)?;
+    let kv_exp = mlx_rs::ops::expand_dims(&kv_scaled, -1)?;
+    let cmp = kv_exp.ge(&config.boundaries)?;
     let indices = mlx_rs::ops::sum_axis(&cmp, -1, Some(false))?;
     let indices = indices.as_dtype(mlx_rs::Dtype::Uint8)?;
 
-    Ok((indices, norm))
+    // Split back along head dim
+    let idx_parts = mlx_rs::ops::split(&indices, 2, Some(1))?;
+    let norm_parts = mlx_rs::ops::split(&norm, 2, Some(1))?;
+    debug_assert_eq!(idx_parts[0].dim(1), num_kv_heads);
+    Ok(((idx_parts[0].clone(), norm_parts[0].clone()),
+        (idx_parts[1].clone(), norm_parts[1].clone())))
 }
 
-/// Dequantize: lookup → unscale → inverse rotate → scale by norm.
-/// Returns [B, H, T, D] in bf16 (9-bit model — bf16 exceeds activation precision).
-fn turbo_dequantize(
-    indices: &Array,
-    norms: &Array,
+/// Dequantize K and V together: concat along heads, one pipeline, split back.
+/// Returns (keys, values) in bf16.
+fn turbo_dequantize_kv(
+    key_indices: &Array,
+    key_norms: &Array,
+    value_indices: &Array,
+    value_norms: &Array,
     config: &TurboQuantConfig,
-) -> Result<Array, Exception> {
+) -> Result<(Array, Array), Exception> {
+    let num_kv_heads = key_indices.dim(1);
+
+    // [B, 2H, T, D]
+    let indices = mlx_rs::ops::concatenate_axis(&[key_indices, value_indices], 1)?;
+    let norms = mlx_rs::ops::concatenate_axis(&[key_norms, value_norms], 1)?;
+
     let idx = indices.as_dtype(mlx_rs::Dtype::Int32)?;
     let shape = indices.shape().to_vec();
     let flat = idx.flatten(None, None)?;
@@ -131,11 +147,15 @@ fn turbo_dequantize(
     let vals = flat_vals.reshape(&shape)?;
 
     let inv_scale = Array::from_f32(1.0 / config.sqrt_d);
-    let x_rot = &vals * &inv_scale;
-    let x_unit = mlx_rs::ops::matmul(&x_rot, &config.rotation_t)?;
+    let kv_rot = &vals * &inv_scale;
+    let kv_unit = mlx_rs::ops::matmul(&kv_rot, &config.rotation_t)?;
 
-    let result = &x_unit * norms;
-    result.as_dtype(mlx_rs::Dtype::Bfloat16)
+    let kv = &kv_unit * &norms;
+    let kv = kv.as_dtype(mlx_rs::Dtype::Bfloat16)?;
+
+    let parts = mlx_rs::ops::split(&kv, 2, Some(1))?;
+    debug_assert_eq!(parts[0].dim(1), num_kv_heads);
+    Ok((parts[0].clone(), parts[1].clone()))
 }
 
 /// Append new array to cached, or return new if no cache yet.
@@ -239,8 +259,8 @@ impl KVCache {
                 value_norms,
                 config,
             } => {
-                let (new_ki, new_kn) = turbo_quantize(&keys, config)?;
-                let (new_vi, new_vn) = turbo_quantize(&values, config)?;
+                let ((new_ki, new_kn), (new_vi, new_vn)) =
+                    turbo_quantize_kv(&keys, &values, config)?;
 
                 let ki = concat_or_init(key_indices, new_ki)?;
                 let kn = concat_or_init(key_norms, new_kn)?;
@@ -253,8 +273,7 @@ impl KVCache {
                 *value_indices = Some(vi.clone());
                 *value_norms = Some(vn.clone());
 
-                let k = turbo_dequantize(&ki, &kn, config)?;
-                let v = turbo_dequantize(&vi, &vn, config)?;
+                let (k, v) = turbo_dequantize_kv(&ki, &kn, &vi, &vn, config)?;
                 Ok((k, v))
             }
         }
