@@ -63,6 +63,14 @@ impl DecoderLayer {
         matches!(&self.attention, AttentionLayer::Gemma4(_))
     }
 
+    pub fn kv_head_dim(&self) -> usize {
+        match &self.attention {
+            AttentionLayer::Full(a) => a.head_dim,
+            AttentionLayer::Gemma4(a) => a.head_dim,
+            AttentionLayer::Linear(_) => 0, // not used
+        }
+    }
+
     pub fn gate_for_prediction(&self) -> &QuantizedLinear {
         match &self.mlp {
             MoeVariant::Qwen(moe) => &moe.gate,
@@ -366,7 +374,7 @@ impl Model {
                 } else {
                     match kv_quant_bits {
                         Some(bits) => Cache::KV(KVCache::new_quantized(
-                            self.head_dim, bits,
+                            layer.kv_head_dim(), bits,
                         )),
                         None => Cache::KV(KVCache::new()),
                     }

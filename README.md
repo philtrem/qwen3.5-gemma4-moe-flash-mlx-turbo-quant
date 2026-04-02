@@ -32,7 +32,7 @@ Cancellation is what makes this work — without it, speculative I/O contends wi
 | Gemma 4 26B | 3.35 MB | 26.8 MB | 30 | 803 MB |
 | Qwen 3.5 35B | 1.77 MB | 14.2 MB | 40 | 566 MB |
 
-Gemma 4 reads 42% more data per token despite fewer layers, because its experts are ~2× bigger (hidden 2816×704 vs 2048×512).
+Gemma 4 26B-A4B is actually heavier on I/O per token than Qwen 3.5 35B-A3B despite being a smaller model. Each expert is ~2× bigger (3.35 MB vs 1.77 MB) because of wider hidden dimensions (2816×704 vs 2048×512). With 30 MoE layers × 8 active experts, that's 803 MB read from SSD per token — 42% more than Qwen's 566 MB. On a 16 GB M4 where I/O is the bottleneck, that's the whole story.
 
 ### Why not just load everything into RAM?
 
