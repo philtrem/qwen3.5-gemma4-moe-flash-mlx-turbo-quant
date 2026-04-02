@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -9,58 +10,177 @@ use mlx_rs::Array;
 use crate::ffi;
 use crate::memory::{ExpertMemoryManager, SingleExpertTensors};
 use crate::model::mlp::{QuantizedLinear, MLP};
-use crate::model::norm::RMSNorm;
 use crate::perf::PerfStats;
 
-/// Prediction context passed from layer L to predict layer L+1's routing.
-/// Carries the correct preprocessing for each model's router.
-pub enum PredictionContext<'a> {
-    /// Qwen: post_attention_layernorm → gate projection
-    Qwen {
-        gate: &'a QuantizedLinear,
-        ln: &'a RMSNorm,
-    },
-    /// Gemma4: RMSNormNoScale → ×root_size → ×router_scale → router_proj
-    Gemma4 {
-        router_proj: &'a QuantizedLinear,
-        router_scale: &'a Array,
-        root_size: f32,
-        rms_norm_eps: f32,
-    },
+/// Co-occurrence predictor: predicts next layer's experts from current layer's actual routing.
+/// Built from calibration data. At inference, a table lookup replaces the GPU router projection.
+pub struct CooccurrencePredictor {
+    /// cooccur[layer_pair][expert_i * num_experts + expert_j] = P(j at L+1 | i at L)
+    /// layer_pair index = source layer (0..num_layers-1)
+    tables: Vec<Vec<f32>>,
+    num_experts: usize,
+    pred_k: usize,
 }
 
-/// Predict top-12 experts for the next layer using L's MoE input and L+1's router params.
-fn predict_next_layer_experts(x: &Array, ctx: PredictionContext) -> Result<Array, Exception> {
-    let pred_k = 12i32;
-    let pred_logits = match ctx {
-        PredictionContext::Qwen { gate, ln } => {
-            let normed = ln.forward(x)?;
-            gate.forward(&normed)?
+impl CooccurrencePredictor {
+    /// Predict top-k experts for `next_layer` given `actual_experts` routed at current layer.
+    /// Returns sorted, deduplicated expert indices.
+    pub fn predict(&self, layer: usize, actual_experts: &[i32]) -> Vec<i32> {
+        if layer >= self.tables.len() {
+            return Vec::new();
         }
-        PredictionContext::Gemma4 { router_proj, router_scale, root_size, rms_norm_eps } => {
-            // Replicate the actual Gemma4 router preprocessing
-            let x2 = x * x;
-            let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
-            let eps = Array::from_f32(rms_norm_eps);
-            let rms = mlx_rs::ops::rsqrt(&(&mean + &eps))?;
-            let normed = x * &rms;
-            let root = Array::from_f32(root_size).as_dtype(x.dtype())?;
-            let scaled = &normed * &root;
-            let rs = router_scale.as_dtype(x.dtype())?;
-            let scaled = &scaled * &rs;
-            router_proj.forward(&scaled)?
+        let table = &self.tables[layer];
+        let n = self.num_experts;
+
+        // Sum co-occurrence rows for each active expert
+        let mut scores = vec![0.0f32; n];
+        for &e in actual_experts {
+            let row_start = e as usize * n;
+            for j in 0..n {
+                scores[j] += table[row_start + j];
+            }
         }
-    };
-    let pred_inds = mlx_rs::ops::argpartition_axis(&pred_logits, -pred_k, -1)?;
-    let pred_num = pred_inds.dim(pred_inds.ndim() as i32 - 1);
-    let pred_split = pred_num - pred_k;
-    let pred_parts = mlx_rs::ops::split_sections(&pred_inds, &[pred_split], Some(-1))?;
-    let pred_topk = pred_parts[1].as_dtype(mlx_rs::Dtype::Int32)?;
-    pred_topk.reshape(&[-1])
+
+        // Find top-k by partial sort
+        let mut indices: Vec<i32> = (0..n as i32).collect();
+        let k = self.pred_k.min(n);
+        indices.select_nth_unstable_by(k - 1, |&a, &b| {
+            scores[b as usize].partial_cmp(&scores[a as usize]).unwrap()
+        });
+        indices.truncate(k);
+        indices.sort();
+        indices
+    }
+
+    /// Save co-occurrence tables to a binary file.
+    /// Format: [num_layers: u32][num_experts: u32][pred_k: u32][tables: f32...]
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(&(self.tables.len() as u32).to_le_bytes())?;
+        f.write_all(&(self.num_experts as u32).to_le_bytes())?;
+        f.write_all(&(self.pred_k as u32).to_le_bytes())?;
+        for table in &self.tables {
+            for &v in table {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load co-occurrence tables from a binary file.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let data = std::fs::read(path)?;
+        let num_layers = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let num_experts = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let pred_k = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let table_size = num_experts * num_experts;
+        let mut tables = Vec::with_capacity(num_layers);
+        let mut offset = 12;
+        for _ in 0..num_layers {
+            let mut table = Vec::with_capacity(table_size);
+            for _ in 0..table_size {
+                table.push(f32::from_le_bytes(data[offset..offset+4].try_into().unwrap()));
+                offset += 4;
+            }
+            tables.push(table);
+        }
+        Ok(Self { tables, num_experts, pred_k })
+    }
 }
 
-/// Tracks gate-reuse prediction accuracy: how well layer L's gate input
-/// predicts layer L+1's routing when run through L+1's router.
+/// Collects per-layer routing decisions during calibration to build co-occurrence tables.
+pub struct CalibrationRecorder {
+    num_layers: usize,
+    num_experts: usize,
+    /// Per-token routing: routing_log[token][layer] = sorted expert indices
+    routing_log: Vec<Vec<Vec<i32>>>,
+    /// Current token's routing (built layer by layer)
+    current_token: Vec<Vec<i32>>,
+}
+
+impl CalibrationRecorder {
+    pub fn new(num_layers: usize, num_experts: usize) -> Self {
+        Self {
+            num_layers,
+            num_experts,
+            routing_log: Vec::new(),
+            current_token: Vec::with_capacity(num_layers),
+        }
+    }
+
+    /// Record which experts were routed at this layer for the current token.
+    pub fn record_layer(&mut self, _layer: usize, experts: &[i32]) {
+        self.current_token.push(experts.to_vec());
+    }
+
+    /// Finalize current token's routing and start a new token.
+    pub fn end_token(&mut self) {
+        if self.current_token.len() == self.num_layers {
+            let token_routing = std::mem::replace(
+                &mut self.current_token,
+                Vec::with_capacity(self.num_layers),
+            );
+            self.routing_log.push(token_routing);
+        } else {
+            self.current_token.clear();
+        }
+    }
+
+    /// Build co-occurrence predictor from recorded data.
+    pub fn build_predictor(&self, pred_k: usize) -> CooccurrencePredictor {
+        let n = self.num_experts;
+        let num_pairs = self.num_layers - 1;
+        let mut tables = vec![vec![0u32; n * n]; num_pairs];
+
+        // Count co-occurrences: for each token, for each layer pair (L, L+1),
+        // for each expert_i at L and expert_j at L+1, increment count.
+        for token_routing in &self.routing_log {
+            for l in 0..num_pairs {
+                let experts_l = &token_routing[l];
+                let experts_l1 = &token_routing[l + 1];
+                for &ei in experts_l {
+                    for &ej in experts_l1 {
+                        tables[l][ei as usize * n + ej as usize] += 1;
+                    }
+                }
+            }
+        }
+
+        // Normalize: each row sums to 1 (conditional probability)
+        let float_tables: Vec<Vec<f32>> = tables
+            .into_iter()
+            .map(|table| {
+                let mut ftable = vec![0.0f32; n * n];
+                for i in 0..n {
+                    let row_start = i * n;
+                    let row_sum: u32 = table[row_start..row_start + n].iter().sum();
+                    if row_sum > 0 {
+                        let inv = 1.0 / row_sum as f32;
+                        for j in 0..n {
+                            ftable[row_start + j] = table[row_start + j] as f32 * inv;
+                        }
+                    }
+                }
+                ftable
+            })
+            .collect();
+
+        eprintln!(
+            "Built co-occurrence predictor: {} layer-pairs, {} experts, {} tokens, pred_k={}",
+            num_pairs, n, self.routing_log.len(), pred_k
+        );
+
+        CooccurrencePredictor {
+            tables: float_tables,
+            num_experts: n,
+            pred_k,
+        }
+    }
+}
+
+
+/// Tracks prediction accuracy and manages co-occurrence prediction / calibration.
 pub struct TransitionProfiler {
     num_layers: usize,
     gate_total: usize,
@@ -69,6 +189,10 @@ pub struct TransitionProfiler {
     gate_per_layer_hits: Vec<usize>,
     /// Pending prediction from previous layer (layer_idx, predicted_experts)
     pub pending_prediction: Option<(usize, Vec<i32>)>,
+    /// Co-occurrence predictor (loaded from calibration data)
+    pub cooccur: Option<CooccurrencePredictor>,
+    /// Calibration recorder (active during --calibrate)
+    pub recorder: Option<CalibrationRecorder>,
 }
 
 impl TransitionProfiler {
@@ -80,10 +204,12 @@ impl TransitionProfiler {
             gate_per_layer_total: vec![0; num_layers],
             gate_per_layer_hits: vec![0; num_layers],
             pending_prediction: None,
+            cooccur: None,
+            recorder: None,
         }
     }
 
-    /// Compare predicted experts (from gate reuse) against actual routing.
+    /// Compare predicted experts against actual routing.
     pub fn record_gate_reuse(&mut self, layer: usize, predicted: &[i32], actual: &[i32]) {
         for &e in actual {
             self.gate_total += 1;
@@ -95,15 +221,20 @@ impl TransitionProfiler {
         }
     }
 
-    /// End of token: clear pending prediction.
+    /// End of token: clear pending prediction and finalize calibration recording.
     pub fn end_token(&mut self) {
         self.pending_prediction = None;
+        if let Some(ref mut rec) = self.recorder {
+            rec.end_token();
+        }
     }
 
     /// Report prediction accuracy.
     pub fn report(&self) {
         if self.gate_total > 0 {
-            eprintln!("\n=== Gate-Reuse Prediction (pre-MoE + next LN, top-12) ===");
+            let method = if self.cooccur.is_some() { "co-occurrence" } else { "router-projection" };
+            let k = self.cooccur.as_ref().map(|c| c.pred_k).unwrap_or(12);
+            eprintln!("\n=== Prediction ({method}, top-{k}) ===");
             eprintln!(
                 "  Overall: {:.1}% ({}/{})",
                 self.gate_hits as f64 / self.gate_total as f64 * 100.0,
@@ -152,7 +283,6 @@ impl SparseMoeBlock {
         x: &Array,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
@@ -179,31 +309,16 @@ impl SparseMoeBlock {
         let shared_gate = mlx_rs::ops::sigmoid(&self.shared_expert_gate.forward(x)?)?;
         let shared_y = &shared_gate * &shared_y;
 
-        // 3. Compute routing indices + scores (lazy, will batch with prediction)
+        // 3. Compute routing indices + scores
         let flat_idx = inds.reshape(&[-1])?;
         let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
 
         let seq_len = x.dim(1);
         let is_decode = seq_len == 1;
 
-        // Speculative prediction for next layer (lazy graph, batched with routing eval)
-        let pred_flat = if is_decode {
-            if let Some(ctx) = next_layer_gate {
-                Some(predict_next_layer_experts(x, ctx)?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Single GPU sync: routing + scores + prediction (zero extra sync overhead)
+        // GPU sync: routing + scores
         let _t = Instant::now();
-        if let Some(ref pf) = pred_flat {
-            mlx_rs::transforms::eval([&flat_idx, &scores_f32, pf])?;
-        } else {
-            mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
-        }
+        mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
         perf.acc(&perf.moe_routing_eval, _t.elapsed());
         let flat_data: &[i32] = flat_idx.as_slice();
         let scores_data: &[f32] = scores_f32.as_slice();
@@ -219,10 +334,7 @@ impl SparseMoeBlock {
             .map(|(i, &orig)| (orig, i as i32))
             .collect();
 
-        // Reactive prefetch via GCD userInitiated queue:
-        // F_RDADVISE + madvise(WILLNEED) + prefault touch per expert.
-        // Blocks until all pages are resident — zero page faults during eval.
-        // Skip if NOREACTIVE=1 (for A/B testing).
+        // Reactive prefetch via GCD userInitiated queue
         if is_decode && !*NOREACTIVE.get_or_init(|| std::env::var("NOREACTIVE").is_ok()) {
             let group = mem.prefetch_gcd_reactive(self.layer_idx, &unique);
             mem.wait_prefetch_group(group);
@@ -235,27 +347,28 @@ impl SparseMoeBlock {
         }
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Check pending prediction from previous layer (gate-reuse accuracy)
+        // Prediction + accuracy tracking + calibration recording
         if let Some(tp_ref) = tp {
             let mut tp_mut = tp_ref.borrow_mut();
+
+            // Check pending prediction from previous layer
             if let Some((pred_layer, predicted)) = tp_mut.pending_prediction.take() {
                 if pred_layer == self.layer_idx {
                     tp_mut.record_gate_reuse(self.layer_idx, &predicted, &unique);
                 }
             }
-        }
 
-        // Record prediction for pipeline prefetch + fire F_RDADVISE
-        if let Some(ref pf) = pred_flat {
-            let pred_data: &[i32] = pf.as_slice();
-            let mut pred_unique: Vec<i32> = pred_data.to_vec();
-            pred_unique.sort();
-            pred_unique.dedup();
-            let next_layer = self.layer_idx + 1;
-            // Prediction recorded — speculative prefetch fires from mod.rs
-            // during eval (after blocking pread is done) to avoid SSD contention.
-            if let Some(tp_ref) = tp {
-                tp_ref.borrow_mut().pending_prediction = Some((next_layer, pred_unique));
+            // Record routing for calibration
+            if let Some(ref mut rec) = tp_mut.recorder {
+                rec.record_layer(self.layer_idx, &unique);
+            }
+
+            // Predict next layer via co-occurrence table (CPU lookup, ~0 cost)
+            if is_decode {
+                if let Some(ref cooccur) = tp_mut.cooccur {
+                    let predicted = cooccur.predict(self.layer_idx, &unique);
+                    tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
+                }
             }
         }
 
@@ -439,7 +552,6 @@ impl Gemma4MoeBlock {
         x: &Array,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let k = self.top_k as i32;
@@ -455,46 +567,28 @@ impl Gemma4MoeBlock {
 
         let neg_scores = mlx_rs::ops::negative(&expert_scores)?;
         let inds_full = mlx_rs::ops::argpartition_axis(&neg_scores, k - 1, -1)?;
-        // Take top-k (first k elements after argpartition of negated scores)
         let parts = mlx_rs::ops::split_sections(&inds_full, &[k], Some(-1))?;
         let inds = parts[0].as_dtype(mlx_rs::Dtype::Int32)?;
 
         let scores = mlx_rs::ops::indexing::take_along_axis(&router_probs, &inds, Some(-1))?;
-        // Renormalize
         let s = mlx_rs::ops::sum_axis(&scores, -1, Some(true))?;
         let scores = &scores / &s;
-        // Apply per-expert scale
         let flat_idx_for_scale = inds.reshape(&[-1])?;
         let per_exp_scales = mlx_rs::ops::indexing::take_axis(&self.per_expert_scale, &flat_idx_for_scale, 0)?;
         let per_exp_scales = per_exp_scales.reshape(inds.shape())?;
         let per_exp_scales_typed = per_exp_scales.as_dtype(scores.dtype())?;
         let scores = &scores * &per_exp_scales_typed;
 
-        // 2. Compute routing indices (lazy graph)
+        // 2. Compute routing indices
         let flat_idx = inds.reshape(&[-1])?;
         let scores_f32 = scores.as_dtype(mlx_rs::Dtype::Float32)?;
 
         let seq_len = x.dim(1);
         let is_decode = seq_len == 1;
 
-        // Speculative prediction for next layer
-        let pred_flat = if is_decode {
-            if let Some(ctx) = next_layer_gate {
-                Some(predict_next_layer_experts(x, ctx)?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // GPU sync
+        // GPU sync: routing + scores
         let _t = Instant::now();
-        if let Some(ref pf) = pred_flat {
-            mlx_rs::transforms::eval([&flat_idx, &scores_f32, pf])?;
-        } else {
-            mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
-        }
+        mlx_rs::transforms::eval([&flat_idx, &scores_f32])?;
         perf.acc(&perf.moe_routing_eval, _t.elapsed());
         let flat_data: &[i32] = flat_idx.as_slice();
         let scores_data: &[f32] = scores_f32.as_slice();
@@ -518,25 +612,28 @@ impl Gemma4MoeBlock {
         }
         perf.acc(&perf.routing_cpu, _t.elapsed());
 
-        // Check pending prediction
+        // Prediction + accuracy tracking + calibration recording
         if let Some(tp_ref) = tp {
             let mut tp_mut = tp_ref.borrow_mut();
+
+            // Check pending prediction from previous layer
             if let Some((pred_layer, predicted)) = tp_mut.pending_prediction.take() {
                 if pred_layer == self.layer_idx {
                     tp_mut.record_gate_reuse(self.layer_idx, &predicted, &unique);
                 }
             }
-        }
 
-        // Record prediction for pipeline prefetch
-        if let Some(ref pf) = pred_flat {
-            let pred_data: &[i32] = pf.as_slice();
-            let mut pred_unique: Vec<i32> = pred_data.to_vec();
-            pred_unique.sort();
-            pred_unique.dedup();
-            let next_layer = self.layer_idx + 1;
-            if let Some(tp_ref) = tp {
-                tp_ref.borrow_mut().pending_prediction = Some((next_layer, pred_unique));
+            // Record routing for calibration
+            if let Some(ref mut rec) = tp_mut.recorder {
+                rec.record_layer(self.layer_idx, &unique);
+            }
+
+            // Predict next layer via co-occurrence table (CPU lookup, ~0 cost)
+            if is_decode {
+                if let Some(ref cooccur) = tp_mut.cooccur {
+                    let predicted = cooccur.predict(self.layer_idx, &unique);
+                    tp_mut.pending_prediction = Some((self.layer_idx + 1, predicted));
+                }
             }
         }
 

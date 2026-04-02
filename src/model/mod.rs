@@ -71,21 +71,6 @@ impl DecoderLayer {
         }
     }
 
-    pub fn prediction_context(&self) -> moe::PredictionContext<'_> {
-        match &self.mlp {
-            MoeVariant::Qwen(moe) => moe::PredictionContext::Qwen {
-                gate: &moe.gate,
-                ln: &self.post_attention_layernorm,
-            },
-            MoeVariant::Gemma4(moe) => moe::PredictionContext::Gemma4 {
-                router_proj: &moe.router_proj,
-                router_scale: &moe.router_scale,
-                root_size: moe.root_size,
-                rms_norm_eps: moe.rms_norm_eps,
-            },
-        }
-    }
-
     pub fn forward(
         &mut self,
         x: &Array,
@@ -93,13 +78,12 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         if self.is_gemma4() {
-            self.forward_gemma4(x, mask, cache, mem, perf, next_layer_gate, tp)
+            self.forward_gemma4(x, mask, cache, mem, perf, tp)
         } else {
-            self.forward_qwen(x, mask, cache, mem, perf, next_layer_gate, tp)
+            self.forward_qwen(x, mask, cache, mem, perf, tp)
         }
     }
 
@@ -110,7 +94,6 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -126,7 +109,7 @@ impl DecoderLayer {
         let h = x + &attn_out;
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = match &self.mlp {
-            MoeVariant::Qwen(moe) => moe.forward(&normed, mem, perf, next_layer_gate, tp)?,
+            MoeVariant::Qwen(moe) => moe.forward(&normed, mem, perf, tp)?,
             _ => unreachable!(),
         };
         Ok(&h + &mlp_out)
@@ -139,7 +122,6 @@ impl DecoderLayer {
         cache: &mut Cache,
         mem: &ExpertMemoryManager,
         perf: &PerfStats,
-        next_layer_gate: Option<moe::PredictionContext>,
         tp: Option<&RefCell<TransitionProfiler>>,
     ) -> Result<Array, Exception> {
         // Attention block
@@ -165,7 +147,7 @@ impl DecoderLayer {
         // MoE expert path
         let h2_input = self.pre_feedforward_layernorm_2.as_ref().unwrap().forward(&h)?;
         let h2 = match &self.mlp {
-            MoeVariant::Gemma4(moe) => moe.forward(&h2_input, mem, perf, next_layer_gate, tp)?,
+            MoeVariant::Gemma4(moe) => moe.forward(&h2_input, mem, perf, tp)?,
             _ => unreachable!(),
         };
         let h2 = self.post_feedforward_layernorm_2.as_ref().unwrap().forward(&h2)?;
@@ -271,14 +253,7 @@ impl TextModel {
         let num_layers = self.layers.len();
 
         for i in 0..num_layers {
-            let (head, tail) = self.layers.split_at_mut(i + 1);
-            let layer = &mut head[i];
-            let next_gate_ln = if speculate {
-                tail.first()
-                    .map(|next| next.prediction_context())
-            } else {
-                None
-            };
+            let layer = &mut self.layers[i];
             let mask = match self.model_type {
                 ModelType::Qwen => {
                     if layer.is_linear() { None } else { full_mask.as_ref() }
@@ -291,7 +266,7 @@ impl TextModel {
                     }
                 }
             };
-            h = layer.forward(&h, mask, &mut cache[i], mem, perf, next_gate_ln, tp)?;
+            h = layer.forward(&h, mask, &mut cache[i], mem, perf, tp)?;
 
             let _t = Instant::now();
             mlx_rs::transforms::async_eval(std::iter::once(&h))?;

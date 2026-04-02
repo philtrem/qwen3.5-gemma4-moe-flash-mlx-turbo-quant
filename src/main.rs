@@ -54,12 +54,15 @@ enum Command {
         /// Disable TurboQuant KV cache quantization (use plain bf16).
         #[arg(long)]
         no_kv_quant: bool,
-        /// Disable speculative F_RDADVISE prefetch for next-layer predicted experts.
+        /// Disable speculative prefetch for next-layer predicted experts.
         #[arg(long)]
         no_speculate: bool,
         /// Load warm set at startup (preads frequent experts into page cache).
         #[arg(long)]
         warm_set: bool,
+        /// Calibrate co-occurrence predictor using N tokens, save to model dir.
+        #[arg(long)]
+        calibrate: Option<usize>,
     },
 }
 
@@ -89,6 +92,7 @@ fn main() -> anyhow::Result<()> {
             no_kv_quant,
             no_speculate,
             warm_set,
+            calibrate,
         } => {
             let kv_quant_bits = if no_kv_quant { None } else { kv_quant_bits };
             // Load config
@@ -155,16 +159,41 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // Load co-occurrence predictor if available
+            let cooccur_path = model_path.join("cooccurrence.bin");
+            let cooccur = if calibrate.is_none() && cooccur_path.exists() {
+                match model::moe::CooccurrencePredictor::load(&cooccur_path) {
+                    Ok(p) => {
+                        eprintln!("Loaded co-occurrence predictor from {}", cooccur_path.display());
+                        Some(p)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to load co-occurrence predictor: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Set up calibration recorder if requested
+            let recorder = calibrate.map(|_| {
+                let num_experts = args.num_experts;
+                eprintln!("Calibration mode: recording routing decisions");
+                model::moe::CalibrationRecorder::new(args.num_hidden_layers, num_experts)
+            });
+
             // Generate
             if let Some(bits) = kv_quant_bits {
                 eprintln!("TurboQuant KV cache: {}-bit", bits);
             }
-            let speculate = !no_speculate;
+            let speculate = !no_speculate && calibrate.is_none();
             eprintln!("Engine ready.\n");
-            if no_speculate {
+            if no_speculate || calibrate.is_some() {
                 eprintln!("Speculative prediction: disabled");
             }
-            let _output = engine::generate(
+            let max_tokens = calibrate.unwrap_or(max_tokens);
+            let (_output, recorder) = engine::generate(
                 &mut model,
                 &tokenizer,
                 &chat_prompt,
@@ -174,7 +203,16 @@ fn main() -> anyhow::Result<()> {
                 &mem_mgr,
                 kv_quant_bits,
                 speculate,
+                cooccur,
+                recorder,
             )?;
+
+            // Save calibration results
+            if let Some(recorder) = recorder {
+                let predictor = recorder.build_predictor(12);
+                predictor.save(&cooccur_path)?;
+                eprintln!("Saved co-occurrence predictor to {}", cooccur_path.display());
+            }
         }
     }
 

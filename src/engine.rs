@@ -7,7 +7,7 @@ use mlx_rs::Array;
 
 use crate::memory::ExpertMemoryManager;
 use crate::model::Model;
-use crate::model::moe::TransitionProfiler;
+use crate::model::moe::{TransitionProfiler, CooccurrencePredictor, CalibrationRecorder};
 use crate::perf::PerfStats;
 use crate::tokenizer::QwenTokenizer;
 
@@ -21,10 +21,15 @@ pub fn generate(
     mem: &ExpertMemoryManager,
     kv_quant_bits: Option<u8>,
     speculate: bool,
-) -> anyhow::Result<String> {
+    cooccur: Option<CooccurrencePredictor>,
+    recorder: Option<CalibrationRecorder>,
+) -> anyhow::Result<(String, Option<CalibrationRecorder>)> {
     let perf = PerfStats::new();
     let num_layers = model.model.layers.len();
-    let tp = RefCell::new(TransitionProfiler::new(num_layers));
+    let mut tp_inner = TransitionProfiler::new(num_layers);
+    tp_inner.cooccur = cooccur;
+    tp_inner.recorder = recorder;
+    let tp = RefCell::new(tp_inner);
     let input_ids = tokenizer.encode(prompt)?;
     let mut cache = model.make_cache(kv_quant_bits);
 
@@ -136,7 +141,8 @@ pub fn generate(
     perf.report(tokens_generated);
     tp.borrow().report();
 
-    Ok(tokenizer.decode(&generated)?)
+    let recorder = tp.into_inner().recorder;
+    Ok((tokenizer.decode(&generated)?, recorder))
 }
 
 fn sample(logits: &Array, temperature: f32, top_p: f32) -> Result<Array, Exception> {
