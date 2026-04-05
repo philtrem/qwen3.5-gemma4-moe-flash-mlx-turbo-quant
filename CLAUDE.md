@@ -56,9 +56,9 @@ cargo build --release
 - **config.rs** — `TextModelArgs` with `ModelType` enum (Qwen/Gemma4). Auto-detects from config.json. Handles both naming conventions.
 - **model/** — Model/TextModel/DecoderLayer with MoeVariant (Qwen/Gemma4), plus:
   - **attention.rs** — Qwen full attention (output gating, partial RoPE)
-  - **gemma4_attention.rs** — Gemma4 attention (no gating, K==V for full-attn, v_norm, scale=1.0, per-layer RoPE/head_dim)
+  - **gemma4_attention.rs** — Gemma4 attention (no gating, K==V for full-attn, v_norm, scale=1.0, per-layer RoPE/head_dim). `forward_speculative()` for Level C: runs attention with virtual KV append (no cache mutation).
   - **gated_delta.rs** — Qwen GatedDeltaNet linear attention
-  - **moe.rs** — SparseMoeBlock (Qwen: shared expert, SiLU) + Gemma4MoeBlock (router with norm+scale+per_expert_scale, GELU)
+  - **moe.rs** — SparseMoeBlock (Qwen: shared expert, SiLU) + Gemma4MoeBlock (router with norm+scale+per_expert_scale, GELU). TransitionProfiler with RouterWeightsRef for Level B CPU prediction.
   - **mlp.rs** — QuantizedLinear, MLP (SiLU), GeLUMLP (Gemma4)
   - **norm.rs** — RMSNorm, RMSNormGated, RMSNormNoScale (Gemma4 v_norm)
 - **memory.rs** — ExpertMemoryManager: GCD prefetch (speculative/reactive with QoS + cancel), zero-copy mmap extraction, warm set pread, F_RDADVISE
@@ -71,7 +71,7 @@ cargo build --release
 
 ### I/O strategy (current default, USE_ZEROCOPY=true)
 - **GCD reactive prefetch** (default): After routing eval determines actual experts, `prefetch_gcd_reactive()` dispatches F_RDADVISE + madvise(WILLNEED) + prefault touch per expert on GCD userInitiated queue. Blocks via dispatch_group until all pages resident. Then mmap zerocopy arrays are created — GPU eval is fault-free. Cancels any in-flight speculative workers first to avoid SSD contention. Gated by `NOREACTIVE=1` env var for A/B testing.
-- **GCD speculative prefetch** (on by default, `--no-speculate` to disable): After `async_eval(h)` submits GPU, `prefetch_gcd_speculative()` fires low-priority (utility QoS) F_RDADVISE + madvise + prefault for L+1's predicted experts. Cancellable via atomic flag — reactive cancels these when exact experts are known. Pages touched before cancellation remain in page cache.
+- **GCD speculative prefetch** (on by default, `--no-speculate` to disable): After `async_eval(h)` submits GPU, `prefetch_gcd_speculative()` fires low-priority (utility QoS) **prefault-only** (no F_RDADVISE/madvise — those can't be cancelled once issued) for L+1's predicted experts. Cancellable page-by-page via atomic flag — reactive cancels these when exact experts are known. Pages touched before cancellation remain in page cache.
 - **Warm set pread at startup** (opt-in, `--warm-set`): `mlock_warm_set()` uses parallel pread to guarantee warm expert pages are resident.
 - Per-layer eval via `async_eval` + `eval` separates GPU submission from wait time in perf stats.
 
@@ -116,11 +116,12 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 ## Performance
 
 ### Gemma 4 26B-A4B 4-bit (default model, M4 16GB):
-- **83 tokens**: **4.0 tok/s** (implied 5.3), peaking at 4.6
-- Decode breakdown (190ms/tok): routing CPU/GCD prefetch 93ms (54%), layer eval 40ms (21%), routing eval 24ms (13%), extract 15ms (9%)
-- GPU wait: 30ms (pure compute, zero faults)
+- **80 tokens**: **3.6–3.8 tok/s** (implied 5.1–5.5), peaking at 4.4
+- Decode breakdown (197ms/tok): routing CPU/GCD prefetch 107ms (54%), layer eval+Level C 54ms (27%), routing eval 22ms (11%), extract 14ms (7%)
+- GPU wait: 0.9ms (Level C prediction fills the idle eval window)
 - I/O-bound: 803 MB/token (experts are 3.35 MB each, 2× bigger than Qwen)
-- Gate-reuse prediction: 50.5% overall (24%–82% per-layer) — lower than Qwen due to different routing (norm+scale+per_expert_scale)
+- Level C prediction: **73% overall** (53%–90% per-layer). Dense MLP + speculative attention + next-layer router on h_post_attn. Replaces co-occurrence (50.5%).
+- Theoretical max at current cache hit (~67%): 5.1 tok/s. At 90% cache (long gen): ~8 tok/s. GPU-bound ceiling: ~11 tok/s.
 
 ### Qwen 3.5 35B-A3B 4-bit (M4 16GB):
 - **50 tokens**: **7.7 tok/s** (implied 8.1), peaking at 8.7
@@ -142,10 +143,12 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 | Warm set only (no reactive) | 5.3→6.6 | 0.1 | 137.3 | 132.5 |
 
 ### GCD speculative + cancel: why it works on 4-bit
-- **Cancellation is key**: speculative fires on low-priority GCD utility queue during GPU eval (~0.65ms/layer). When reactive starts (after routing eval), it cancels speculative via atomic flag — no SSD contention.
+- **Prefault-only for speculative** (2026-04-04): speculative workers do ONLY prefault touch (one byte per 16KB page). F_RDADVISE and madvise are skipped for speculative because they issue kernel-level I/O that **cannot be cancelled** — causing SSD contention with reactive. Prefault touch is cancellable page-by-page via atomic generation counter.
+- **Reactive uses full pipeline**: F_RDADVISE + madvise(WILLNEED) + prefault. Only speculative is restricted.
 - Pages touched by speculative before cancellation remain in page cache, reducing reactive's work.
-- Without cancel: 6.3 tok/s (SSD contention). With cancel: 7.7 tok/s (clean handoff).
+- Without cancel: 6.3 tok/s (SSD contention). With cancel: 7.7 tok/s (clean handoff) for Qwen.
 - GCD QoS (utility vs userInitiated) provides OS-level thread priority differentiation.
+- **Gemma4 speculative with Level C prediction**: 3.6–3.8 tok/s, matching no-speculation baseline (speculation adds zero overhead after prefault-only fix).
 
 ### Why pread-based speculative failed on 4-bit (historical)
 - Experts are 1.69 MB (small) — page cache retains them between tokens
@@ -165,9 +168,12 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 - Page faults: 16KB per fault, synchronous kernel trap — 20× slower per byte than explicit pread
 
 ### Expert prediction:
-- **Qwen** (measured 2026-03-30): **Pre-MoE + next LN, top-12**: 84-86% accuracy. Per-layer range: 57% (layer 1) to 96% (layer 34).
-- **Gemma4** (measured 2026-04-02): **50.5% overall** (top-12). Per-layer range: 24% (layer 1) to 82% (layer 22). Lower accuracy due to different router (norm+scale+per_expert_scale vs simple gate).
-- Prediction adds ~6ms routing eval overhead (batched into existing eval)
+- **Qwen** (measured 2026-03-30): **Pre-MoE + next LN, top-12**: 84-86% accuracy. Per-layer range: 57% (layer 1) to 96% (layer 34). Uses co-occurrence table.
+- **Gemma4** (measured 2026-04-04): **Level C prediction: 73% overall** (top-12). Per-layer range: 53% (layer 7) to 90% (layer 26). Three prediction tiers:
+  - **Level C** (default, Gemma4): dense MLP + speculative attention (virtual KV append, no cache mutation) + next-layer router. ~0.6ms/layer GPU, runs lazily between async_eval/eval. Works with both plain and TurboQuant KV cache.
+  - **Level A.5** (fallback): dense MLP + next-layer router (skip attention). ~0 extra cost (fills GPU idle time).
+  - **Level B** (Qwen fallback): CPU dequantized matmul of next-layer router on h_post_attn. ~0.1ms/layer, zero GPU impact. Pre-converted f32 weights in `RouterWeightsRef`.
+- Old co-occurrence baseline for Gemma4 was 50.5% (still used as fallback for Qwen)
 
 ## Key gotchas
 
@@ -188,7 +194,7 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 - **madvise(MADV_WILLNEED) alone is unreliable** — returns before pages are loaded. Combined with prefault touch in GCD workers, it becomes reliable.
 - **mlock HURTS**: page table wire/unwire contends with GPU at kernel vm_map level.
 - **Pread-based speculative is a net negative on 4-bit** — can't be cancelled, always contends. See benchmark matrix.
-- **GCD speculative with cancellation works**: fire-and-forget prefault on utility queue, cancel via atomic when reactive starts. No SSD contention. +0.8 tok/s over no-speculate baseline.
+- **GCD speculative with cancellation works**: fire-and-forget prefault-only on utility queue, cancel via atomic when reactive starts. F_RDADVISE/madvise skipped for speculative (uncancellable kernel I/O causes contention). No SSD contention. Neutral-to-positive throughput impact.
 - Per-layer eval ensures expert arrays are freed after each layer (peak ~13.5 MB for 4-bit, not cumulative)
 - Expert LRU caching does NOT help — working set >> cache size on 16 GB
 - **Warm set pread at startup** (opt-in via `--warm-set`): guarantees 63% of expert pages are resident. Less impactful now that GCD speculative provides similar warming.
@@ -205,7 +211,9 @@ Gemma4 reads 42% more data per token despite fewer layers — experts are ~2× b
 - `NOREACTIVE=1` — skip reactive blocking pread (for A/B testing)
 
 ### Speculative prefetch methods tested:
-- **GCD cancellable prefault (current)**: fire-and-forget on utility queue, cancel via atomic when reactive starts. **Net positive** (+0.8 tok/s). The only method that avoids SSD contention.
+- **GCD prefault-only + Level C prediction (current, Gemma4)**: fire-and-forget prefault on utility queue, cancel via atomic. Level C (dense MLP + speculative attention + next router) predicts at 73%. Speculative adds zero overhead. **Net neutral** (prediction warms cache, prefault-only avoids contention).
+- **GCD cancellable prefault + co-occurrence (current, Qwen)**: fire-and-forget on utility queue, cancel via atomic when reactive starts. **Net positive** (+0.8 tok/s). The only method that avoids SSD contention.
+- **F_RDADVISE + madvise in speculative (old, removed)**: kernel-level I/O hints can't be cancelled once issued. Causes SSD contention with reactive. **Net negative** on Gemma4 (2.7 vs 3.7 tok/s without speculation).
 - **F_RDADVISE only**: lightest (fcntl hint, ~0.5ms/tok). SSD contention with reactive. Net negative.
 - **Main-thread pread**: perfect GPU overlap (wait=1ms) but 2.8ms/layer blocks pipeline. Net negative.
 - **Background rayon pool (4-thread)**: 2.3× background-thread penalty on macOS. Net negative.

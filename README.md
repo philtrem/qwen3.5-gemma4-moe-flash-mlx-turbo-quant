@@ -19,11 +19,19 @@ The model is split into two parts:
 
 The bottleneck isn't compute — it's getting expert bytes from SSD to GPU before it stalls. Without explicit prefetch, the GPU triggers page faults that pull data in 16 KB chunks — synchronous kernel traps that reduce effective throughput to a fraction of what sequential reads achieve. flash-moe avoids this with a two-stage GCD prefetch pipeline:
 
-1. **Speculative** (during GPU eval): After submitting the current layer to the GPU, fire off low-priority (utility QoS) GCD workers to prefault pages for the *next* layer's predicted experts.
-2. **Reactive** (after routing): Once the router picks the actual 8 experts, cancel any in-flight speculative work (atomic flag — no SSD contention), then dispatch high-priority (userInitiated QoS) workers to prefault the exact pages needed. Blocks until all pages are resident.
+1. **Speculative** (during GPU eval): After submitting the current layer to the GPU, fire off low-priority (utility QoS) GCD workers to prefault pages for the *next* layer's predicted experts. Workers do prefault touch only (no F_RDADVISE/madvise — those issue kernel-level I/O that can't be cancelled).
+2. **Reactive** (after routing): Once the router picks the actual 8 experts, cancel any in-flight speculative work (atomic flag — cancellable page-by-page), then dispatch high-priority (userInitiated QoS) workers with full I/O pipeline (F_RDADVISE + madvise + prefault). Blocks until all pages are resident.
 3. **Eval** (zero faults): GPU reads from Metal buffers backed by already-resident mmap pages. Pure compute, no page faults.
 
 Cancellation is what makes this work — without it, speculative I/O contends with reactive and throughput drops significantly.
+
+### Expert prediction
+
+Speculative prefetch needs to predict which experts the next layer will select. flash-moe uses **model-based prediction** rather than statistical tables:
+
+- **Level C** (Gemma4, default): Run the current layer's dense MLP to approximate its output (without waiting for MoE), then run the next layer's attention (virtual KV append — no cache mutation) and router on GPU. All lazy ops, eval'd between async_eval and eval. **73% top-12 accuracy**, GPU wait drops from 30ms to 0.9ms.
+- **Level B** (Qwen, fallback): Run next layer's router projection on h_post_attn via CPU dequantized matmul. Pre-converted f32 weights, zero GPU impact. ~62% accuracy.
+- **Co-occurrence tables** (legacy fallback): Statistical lookup, 50.5% for Gemma4, 84% for Qwen.
 
 ### Per-token I/O
 
