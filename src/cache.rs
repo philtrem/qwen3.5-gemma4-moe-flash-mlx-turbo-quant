@@ -203,6 +203,17 @@ impl KVCache {
         self.offset
     }
 
+    /// Read cached K/V without mutating. Returns None if empty or quantized.
+    /// For speculative attention that must not modify the real cache.
+    pub fn peek_kv(&self) -> Option<(Array, Array)> {
+        match &self.inner {
+            KVCacheInner::Plain { keys: Some(k), values: Some(v) } => {
+                Some((k.clone(), v.clone()))
+            }
+            _ => None, // quantized or empty — fall back to Level A.5
+        }
+    }
+
     /// Store new keys/values and return all cached K/V for SDPA.
     pub fn update_and_fetch(
         &mut self,
@@ -272,6 +283,13 @@ impl Cache {
         match self {
             Cache::KV(kv) => kv,
             _ => panic!("expected KVCache"),
+        }
+    }
+
+    pub fn as_kv_ref(&self) -> Option<&KVCache> {
+        match self {
+            Cache::KV(kv) => Some(kv),
+            _ => None,
         }
     }
 

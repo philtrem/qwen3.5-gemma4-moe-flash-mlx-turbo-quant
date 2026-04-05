@@ -278,13 +278,18 @@ impl TextModel {
 
             let _t = Instant::now();
 
-            // Level A.5 GPU prediction: dense MLP + next router (lazy, no eval yet)
+            // Level C GPU prediction: dense MLP + next attention + next router (lazy)
             let lazy_pred = if speculate && i + 1 < num_layers && self.model_type == ModelType::Gemma4 {
                 let h_pa = tp.and_then(|r| r.borrow_mut().h_post_attn.take());
                 if let Some(h_pa) = h_pa {
-                    Self::predict_level_a5(&self.layers[i], &self.layers[i + 1], &h_pa)
-                        .ok()
-                        .flatten()
+                    let next_mask = match &self.layers[i + 1].attention {
+                        AttentionLayer::Gemma4(a) if a.use_k_eq_v => full_mask.as_ref(),
+                        _ => sliding_mask.as_ref().or(full_mask.as_ref()),
+                    };
+                    Self::predict_level_c(
+                        &self.layers[i], &self.layers[i + 1],
+                        &h_pa, &cache[i + 1], next_mask,
+                    ).ok().flatten()
                 } else {
                     None
                 }
@@ -331,34 +336,56 @@ impl TextModel {
         self.norm.forward(&h)
     }
 
-    /// Level A.5 prediction: run layer L's dense MLP + layer L+1's router on h_post_attn.
-    /// Returns a lazy Array of predicted top-12 expert indices (Int32), or None.
+    /// Level C prediction: dense MLP + next-layer attention + next-layer router.
+    /// Falls back to Level A.5 (skip attention) if KV cache is quantized or empty.
     /// All computations are lazy GPU ops — caller must eval() the result.
-    fn predict_level_a5(
+    fn predict_level_c(
         layer_l: &DecoderLayer,
         layer_l1: &DecoderLayer,
         h_post_attn: &Array,
+        cache_l1: &Cache,
+        mask: Option<&Array>,
     ) -> Result<Option<Array>, Exception> {
-        // Dense MLP path (layer L's resident weights)
+        // Dense MLP path (layer L's resident weights) → approximate layer L output
         let h1 = layer_l.pre_feedforward_layernorm.as_ref().unwrap().forward(h_post_attn)?;
         let h1 = layer_l.dense_mlp.as_ref().unwrap().forward(&h1)?;
         let h1 = layer_l.post_feedforward_layernorm_1.as_ref().unwrap().forward(&h1)?;
-
-        // Approximate layer L output (no MoE)
         let h_approx = layer_l.post_feedforward_layernorm.as_ref().unwrap().forward(&h1)?;
         let mut h_approx = h_post_attn + &h_approx;
         if let Some(ref scalar) = layer_l.layer_scalar {
             h_approx = &h_approx * scalar;
         }
 
-        // Layer L+1's router on the approximate hidden state
+        // Layer L+1's attention on h_approx (speculative, no cache mutation)
+        let router_input = if let AttentionLayer::Gemma4(ref attn) = layer_l1.attention {
+            if let Some(kv_cache) = cache_l1.as_kv_ref() {
+                if let Some(cached_kv) = kv_cache.peek_kv() {
+                    // Full Level C: attention with virtual KV append
+                    let normed = layer_l1.input_layernorm.forward(&h_approx)?;
+                    let attn_out = attn.forward_speculative(
+                        &normed, mask, Some(cached_kv), kv_cache.offset(),
+                    )?;
+                    let attn_out = layer_l1.post_attention_layernorm.forward(&attn_out)?;
+                    &h_approx + &attn_out
+                } else {
+                    // Cache empty (first token) — skip attention
+                    h_approx
+                }
+            } else {
+                // Quantized KV cache — fall back to Level A.5 (skip attention)
+                h_approx
+            }
+        } else {
+            h_approx
+        };
+
+        // Layer L+1's router
         if let MoeVariant::Gemma4(ref moe) = layer_l1.mlp {
-            // RMSNormNoScale → scale → proj → top-12
-            let x2 = &h_approx * &h_approx;
+            let x2 = &router_input * &router_input;
             let mean = mlx_rs::ops::mean_axes(&x2, &[-1], Some(true))?;
             let eps = Array::from_f32(moe.rms_norm_eps);
             let rms = mlx_rs::ops::rsqrt(&(&mean + &eps))?;
-            let normed = &h_approx * &rms;
+            let normed = &router_input * &rms;
             let root = Array::from_f32(moe.root_size).as_dtype(h_post_attn.dtype())?;
             let scaled = &normed * &root;
             let rs = moe.router_scale.as_dtype(h_post_attn.dtype())?;
